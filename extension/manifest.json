@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Memori - ChatGPT Memory Sidebar",
+  "version": "1.0.0",
+  "description": "Save and inject memories into ChatGPT conversations",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://chat.openai.com/*",
+    "https://www.chatgpt.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://www.chatgpt.com/*",
+        "https://*.chatgpt.com/*",
+        "https://*.openai.com/*"
+      ],
+      "js": ["contentScript.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "Toggle Memori Sidebar"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["sidebar.css", "sidebar.js"],
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://www.chatgpt.com/*"
+      ]
+    }
+  ]
+}

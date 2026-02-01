@@ -1,0 +1,164 @@
+/* Memori Sidebar Styles */
+
+#memori-sidebar {
+  position: fixed;
+  top: 0;
+  right: -400px;
+  width: 380px;
+  height: 100vh;
+  background: #ffffff;
+  box-shadow: -2px 0 10px rgba(0, 0, 0, 0.1);
+  z-index: 999999;
+  transition: right 0.3s ease;
+  display: flex;
+  flex-direction: column;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+#memori-sidebar.memori-sidebar-visible {
+  right: 0;
+}
+
+#memori-sidebar-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid #e5e7eb;
+  background: #f9fafb;
+}
+
+#memori-sidebar-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: #111827;
+}
+
+#memori-close-btn {
+  background: none;
+  border: none;
+  font-size: 24px;
+  color: #6b7280;
+  cursor: pointer;
+  padding: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+#memori-close-btn:hover {
+  background: #e5e7eb;
+  color: #111827;
+}
+
+#memori-sidebar-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0;
+}
+
+#memori-memories-list {
+  padding: 12px;
+}
+
+.memori-memory-item {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+  transition: box-shadow 0.2s;
+}
+
+.memori-memory-item:hover {
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.memori-memory-text {
+  color: #374151;
+  font-size: 14px;
+  line-height: 1.5;
+  margin-bottom: 10px;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.memori-memory-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.memori-inject-btn,
+.memori-delete-btn {
+  padding: 6px 12px;
+  border: none;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.memori-inject-btn {
+  background: #10a37f;
+  color: white;
+  flex: 1;
+}
+
+.memori-inject-btn:hover {
+  background: #0d8c6d;
+}
+
+.memori-delete-btn {
+  background: #ef4444;
+  color: white;
+}
+
+.memori-delete-btn:hover {
+  background: #dc2626;
+}
+
+.memori-memory-time {
+  font-size: 11px;
+  color: #9ca3af;
+  margin-top: 4px;
+}
+
+.memori-empty,
+.memori-error {
+  padding: 40px 20px;
+  text-align: center;
+  color: #6b7280;
+  font-size: 14px;
+}
+
+.memori-error {
+  color: #ef4444;
+}
+
+/* Scrollbar styling */
+#memori-sidebar-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+#memori-sidebar-content::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+#memori-sidebar-content::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 3px;
+}
+
+#memori-sidebar-content::-webkit-scrollbar-thumb:hover {
+  background: #a8a8a8;
+}
