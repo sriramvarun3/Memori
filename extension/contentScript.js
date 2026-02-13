@@ -318,7 +318,12 @@ function createSidebar() {
       <button class="memori-tab-btn" data-tab="granola">Granola Recordings</button>
     </div>
     <div id="memori-sidebar-content">
-      <div id="memori-memories-list" class="memori-tab-panel"></div>
+      <div id="memori-memories-panel" class="memori-tab-panel">
+        <div id="memori-export-context-bar">
+          <button id="memori-export-context-btn" class="memori-export-context-btn">Export chat context</button>
+        </div>
+        <div id="memori-memories-list"></div>
+      </div>
       <div id="memori-granola-list" class="memori-tab-panel" style="display:none"></div>
     </div>
   `;
@@ -406,6 +411,31 @@ function createSidebar() {
         overflow-y: auto;
         padding: 0;
       }
+      #memori-export-context-bar {
+        padding: 8px 12px 12px;
+        border-bottom: 1px solid #e5e7eb;
+        margin-bottom: 8px;
+      }
+      .memori-export-context-btn {
+        width: 100%;
+        padding: 8px 12px;
+        border: 1px solid #10a37f;
+        border-radius: 6px;
+        background: #ffffff;
+        color: #10a37f;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        font-family: inherit;
+        transition: all 0.2s;
+      }
+      .memori-export-context-btn:hover {
+        background: #ecfdf5;
+      }
+      .memori-export-context-btn:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
       #memori-memories-list {
         padding: 12px;
       }
@@ -419,6 +449,12 @@ function createSidebar() {
       }
       .memori-memory-item:hover {
         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      }
+      .memori-memory-item.memori-chat-export {
+        border-left: 3px solid #8b5cf6;
+      }
+      .memori-memory-item.memori-chat-export .memori-memory-text {
+        max-height: 250px;
       }
       .memori-memory-text {
         color: #374151;
@@ -510,6 +546,9 @@ function createSidebar() {
       }
       .memori-tab-panel {
         padding: 12px;
+      }
+      #memori-memories-panel {
+        padding: 0;
       }
       .memori-granola-item {
         background: #ffffff;
@@ -665,7 +704,7 @@ function createSidebar() {
 
   // Tab switching
   const tabBtns = sidebar.querySelectorAll('.memori-tab-btn');
-  const memoriesPanel = sidebar.querySelector('#memori-memories-list');
+  const memoriesPanel = sidebar.querySelector('#memori-memories-panel');
   const granolaPanel = sidebar.querySelector('#memori-granola-list');
   tabBtns.forEach(btn => {
     btn.addEventListener('click', () => {
@@ -683,6 +722,38 @@ function createSidebar() {
       }
     });
   });
+
+  // Export context button
+  const exportBtn = sidebar.querySelector('#memori-export-context-btn');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', async () => {
+      exportBtn.disabled = true;
+      exportBtn.textContent = 'Exporting...';
+      try {
+        const result = await exportChatContext();
+        if (result.success) {
+          exportBtn.textContent = `Context exported! (${result.messageCount} messages)`;
+          loadMemoriesIntoSidebar();
+          setTimeout(() => {
+            exportBtn.textContent = 'Export chat context';
+            exportBtn.disabled = false;
+          }, 2500);
+        } else {
+          exportBtn.textContent = result.error || 'Export failed';
+          setTimeout(() => {
+            exportBtn.textContent = 'Export chat context';
+            exportBtn.disabled = false;
+          }, 2000);
+        }
+      } catch (e) {
+        exportBtn.textContent = 'Export failed';
+        setTimeout(() => {
+          exportBtn.textContent = 'Export chat context';
+          exportBtn.disabled = false;
+        }, 2000);
+      }
+    });
+  }
   
   return sidebar;
 }
@@ -855,6 +926,89 @@ function formatGranolaDate(dateStr) {
   }
 }
 
+// ========== Context Export ==========
+
+// Extract all messages from current ChatGPT conversation (in document order)
+function extractChatContext() {
+  const messages = [];
+  const seen = new Set();
+  const selectors = [
+    '[data-message-author-role="user"]',
+    '[data-message-author-role="assistant"]'
+  ];
+  const candidates = [];
+  for (const selector of selectors) {
+    document.querySelectorAll(selector).forEach(el => {
+      const role = el.getAttribute('data-message-author-role');
+      if (role && (role === 'user' || role === 'assistant')) {
+        candidates.push({ el, role });
+      }
+    });
+  }
+  if (candidates.length === 0) {
+    const articles = document.querySelectorAll('article');
+    articles.forEach(article => {
+      const userChild = article.querySelector('[data-message-author-role="user"]');
+      const assistantChild = article.querySelector('[data-message-author-role="assistant"]');
+      const role = userChild ? 'user' : (assistantChild ? 'assistant' : null);
+      if (role) {
+        const contentEl = userChild || assistantChild;
+        candidates.push({ el: contentEl.closest('article') || contentEl, role });
+      }
+    });
+  }
+  candidates.sort((a, b) => {
+    const pos = a.el.compareDocumentPosition(b.el);
+    return (pos & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1;
+  });
+  for (const { el, role } of candidates) {
+    if (seen.has(el)) continue;
+    seen.add(el);
+    let text = (el.innerText || el.textContent || '').trim();
+    const buttons = el.querySelectorAll('button');
+    buttons.forEach(btn => {
+      const btnText = btn.innerText || btn.textContent || '';
+      if (btnText) text = text.replace(btnText, '').trim();
+    });
+    text = text.replace(/Copy code|Regenerate|Thumbs up|Thumbs down/gi, '').trim();
+    if (text) {
+      messages.push({ role, content: text });
+    }
+  }
+  return messages;
+}
+
+// Format messages into compact portable form
+function formatContextCompact(messages) {
+  return messages.map(m => {
+    const label = m.role === 'user' ? 'User' : 'Assistant';
+    return `${label}: ${m.content}`;
+  }).join('\n\n');
+}
+
+// Export chat context and save as memory (type: chat_export)
+async function exportChatContext() {
+  const messages = extractChatContext();
+  if (messages.length === 0) {
+    return { success: false, error: 'No messages found in this chat' };
+  }
+  const compactText = formatContextCompact(messages);
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: 'saveMemory',
+      text: compactText,
+      type: 'chat_export',
+      messageCount: messages.length
+    });
+    if (response && response.success) {
+      return { success: true, messageCount: messages.length };
+    }
+    return { success: false, error: response?.error || 'Failed to save' };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
 // Load memories and display in sidebar
 async function loadMemoriesIntoSidebar() {
   if (!sidebarContainer) return;
@@ -871,9 +1025,12 @@ async function loadMemoriesIntoSidebar() {
     }
     
     listContainer.innerHTML = memories.map(memory => {
+      const isChatExport = memory.type === 'chat_export';
       const isAssistant = memory.type === 'assistant';
-      const typeLabel = isAssistant ? '🤖 Assistant' : '👤 You';
-      const typeClass = isAssistant ? 'memori-assistant' : 'memori-user';
+      const typeLabel = isChatExport
+        ? `💬 Chat export${memory.messageCount ? ` (${memory.messageCount} msgs)` : ''}`
+        : (isAssistant ? '🤖 Assistant' : '👤 You');
+      const typeClass = isChatExport ? 'memori-chat-export' : (isAssistant ? 'memori-assistant' : 'memori-user');
       
       return `
       <div class="memori-memory-item ${typeClass}" data-id="${memory.id}">

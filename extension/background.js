@@ -8,6 +8,7 @@ const GRANOLA_TOKEN_EXPIRY_KEY = 'granola_token_expiry';
 const MCP_ENDPOINT = 'https://mcp.granola.ai/mcp';
 const STORAGE_KEY = 'memori_memories';
 const SETTINGS_KEY = 'memori_settings';
+const MAX_CHAT_EXPORTS = 10;
 
 // Generate a simple UUID
 function generateId() {
@@ -15,7 +16,7 @@ function generateId() {
 }
 
 // Save a memory to storage (FIFO - keep last 50)
-async function saveMemory(text, type = 'user') {
+async function saveMemory(text, type = 'user', messageCount = null) {
   try {
     const result = await chrome.storage.local.get([STORAGE_KEY]);
     let memories = result[STORAGE_KEY] || [];
@@ -25,13 +26,23 @@ async function saveMemory(text, type = 'user') {
       id: generateId(),
       text: text.trim(),
       timestamp: Date.now(),
-      type: type // 'user' or 'assistant'
+      type: type // 'user', 'assistant', or 'chat_export'
     };
+    if (messageCount != null) newMemory.messageCount = messageCount;
     
     // Add to beginning of array
     memories.unshift(newMemory);
     
-    // Keep only last MAX_MEMORIES entries
+    // For chat_export type: keep only last MAX_CHAT_EXPORTS
+    if (type === 'chat_export') {
+      const chatExports = memories.filter(m => m.type === 'chat_export');
+      if (chatExports.length > MAX_CHAT_EXPORTS) {
+        const toRemove = chatExports.slice(MAX_CHAT_EXPORTS).map(m => m.id);
+        memories = memories.filter(m => !toRemove.includes(m.id));
+      }
+    }
+    
+    // Keep only last MAX_MEMORIES entries overall
     if (memories.length > MAX_MEMORIES) {
       memories = memories.slice(0, MAX_MEMORIES);
     }
@@ -39,7 +50,7 @@ async function saveMemory(text, type = 'user') {
     // Save back to storage
     await chrome.storage.local.set({ [STORAGE_KEY]: memories });
     
-    return { success: true, memory: newMemory };
+    return { success: true, memory: newMemory, messageCount: newMemory.messageCount ?? null };
   } catch (error) {
     console.error('Error saving memory:', error);
     return { success: false, error: error.message };
@@ -570,7 +581,7 @@ async function granolaGetMeetingDetails(meetingId) {
 // Listen for messages from content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'saveMemory') {
-    saveMemory(request.text, request.type || 'user').then(sendResponse);
+    saveMemory(request.text, request.type || 'user', request.messageCount).then(sendResponse);
     return true; // Keep channel open for async response
   }
   
