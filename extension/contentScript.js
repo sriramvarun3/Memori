@@ -171,27 +171,89 @@ function extractTextFromInput(input) {
   return text.trim();
 }
 
+// Shared button style for Memori action buttons
+const MEMORI_BUTTON_STYLE = `
+  padding: 10px 16px;
+  background: #10a37f;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  transition: background 0.2s;
+`;
+
+// Create API key modal (shown when key not stored)
+function createApiKeyModal() {
+  const overlay = document.createElement('div');
+  overlay.id = 'memori-api-key-modal';
+  overlay.style.cssText = `
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999999;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  `;
+  overlay.innerHTML = `
+    <div style="background: white; padding: 24px; border-radius: 12px; max-width: 420px; width: 90%; box-shadow: 0 4px 20px rgba(0,0,0,0.2);">
+      <h3 style="margin: 0 0 12px; font-size: 18px;">OpenAI API Key Required</h3>
+      <p style="margin: 0 0 16px; font-size: 14px; color: #6b7280;">Export Context uses OpenAI to compress conversations. Get a key at:</p>
+      <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" style="font-size: 13px; color: #10a37f;">platform.openai.com/api-keys</a>
+      <input type="password" id="memori-api-key-input" placeholder="Paste your API key" style="width: 100%; margin: 16px 0; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 14px; box-sizing: border-box;">
+      <div style="display: flex; gap: 8px; justify-content: flex-end;">
+        <button id="memori-api-key-cancel" style="padding: 8px 16px; background: #e5e7eb; border: none; border-radius: 6px; cursor: pointer; font-size: 13px;">Cancel</button>
+        <button id="memori-api-key-save" style="padding: 8px 16px; background: #10a37f; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px;">Save & Continue</button>
+      </div>
+    </div>
+  `;
+  return overlay;
+}
+
+// Show API key modal, resolve with key or null if cancelled
+function showApiKeyModal() {
+  return new Promise((resolve) => {
+    const existing = document.getElementById('memori-api-key-modal');
+    if (existing) existing.remove();
+    const modal = createApiKeyModal();
+    document.body.appendChild(modal);
+    const input = modal.querySelector('#memori-api-key-input');
+    const saveBtn = modal.querySelector('#memori-api-key-save');
+    const cancelBtn = modal.querySelector('#memori-api-key-cancel');
+    input.focus();
+    saveBtn.addEventListener('click', () => {
+      const key = input.value?.trim();
+      if (key) {
+        chrome.runtime.sendMessage({ action: 'saveOpenAIApiKey', key });
+        modal.remove();
+        resolve(key);
+      }
+    });
+    cancelBtn.addEventListener('click', () => {
+      modal.remove();
+      resolve(null);
+    });
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        modal.remove();
+        resolve(null);
+      }
+    });
+  });
+}
+
 // Create "Save to memory" button
 function createSaveButton() {
   const button = document.createElement('button');
   button.id = 'memori-save-btn';
   button.textContent = '💾 Save to memory';
-  button.style.cssText = `
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    padding: 10px 16px;
-    background: #10a37f;
-    color: white;
-    border: none;
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    z-index: 999998;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    transition: background 0.2s;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  button.style.cssText = MEMORI_BUTTON_STYLE + `
+    position: relative;
+    width: 100%;
   `;
   
   button.addEventListener('mouseenter', () => {
@@ -270,13 +332,96 @@ function createSaveButton() {
   return button;
 }
 
+// Create Export Context button (smart compression via OpenAI)
+function createExportContextButton() {
+  const button = document.createElement('button');
+  button.id = 'memori-export-context-btn';
+  button.textContent = '📋 Export Context';
+  button.style.cssText = MEMORI_BUTTON_STYLE + `
+    position: relative;
+    width: 100%;
+  `;
+  button.addEventListener('mouseenter', () => { button.style.background = '#0d8c6d'; });
+  button.addEventListener('mouseleave', () => { button.style.background = '#10a37f'; });
+  button.addEventListener('click', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const conversation = extractFullConversation();
+    if (conversation.length === 0) {
+      alert('No conversation found to export');
+      return;
+    }
+    let apiKey = null;
+    try {
+      const r = await chrome.runtime.sendMessage({ action: 'getOpenAIApiKey' });
+      apiKey = r?.key?.trim();
+    } catch (_) {}
+    if (!apiKey) {
+      apiKey = await showApiKeyModal();
+      if (!apiKey) return;
+    }
+    button.disabled = true;
+    button.textContent = 'Compressing...';
+    try {
+      const result = await chrome.runtime.sendMessage({
+        action: 'compressAndSaveContext',
+        conversation
+      });
+      if (result.success) {
+        button.textContent = `✓ Exported (${result.messageCount} msgs)`;
+        if (sidebarVisible) loadContextHandoffsIntoSidebar();
+        setTimeout(() => {
+          button.textContent = '📋 Export Context';
+          button.disabled = false;
+        }, 2500);
+      } else {
+        if (result.needsApiKey) {
+          apiKey = await showApiKeyModal();
+          if (apiKey) button.click();
+        } else {
+          alert(result.error || 'Export failed');
+        }
+        button.textContent = '📋 Export Context';
+        button.disabled = false;
+      }
+    } catch (err) {
+      console.error('[Memori] Export context error:', err);
+      alert(err.message || 'Export failed');
+      button.textContent = '📋 Export Context';
+      button.disabled = false;
+    }
+  });
+  return button;
+}
+
+// Create button container (Save + Export Context, stacked)
+function createMemoriButtonContainer() {
+  const container = document.createElement('div');
+  container.id = 'memori-button-container';
+  container.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 999998;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    border-radius: 8px;
+    overflow: hidden;
+    width: 180px;
+  `;
+  const exportBtn = createExportContextButton();
+  const saveBtn = createSaveButton();
+  container.appendChild(exportBtn);
+  container.appendChild(saveBtn);
+  return container;
+}
+
 // Inject save button into ChatGPT input area
 function injectSaveButton() {
-  // Remove existing button if present
-  const existing = document.getElementById('memori-save-btn');
-  if (existing) {
-    existing.remove();
-  }
+  const existing = document.getElementById('memori-button-container');
+  if (existing) existing.remove();
   
   const input = findChatGPTInput();
   if (!input) {
@@ -284,11 +429,10 @@ function injectSaveButton() {
     return;
   }
   
-  console.log('[Memori] Found input element, injecting save button');
-  
-  // Use fixed positioning - always visible in bottom right
-  saveButton = createSaveButton();
-  document.body.appendChild(saveButton);
+  console.log('[Memori] Found input element, injecting buttons');
+  const container = createMemoriButtonContainer();
+  saveButton = container.querySelector('#memori-save-btn');
+  document.body.appendChild(container);
 }
 
 // Create sidebar container
@@ -312,18 +456,26 @@ function createSidebar() {
         <input type="checkbox" id="memori-auto-capture-toggle">
         <span>Auto-capture sent messages</span>
       </label>
+      <div id="memori-openai-key-row" style="margin-top: 12px;">
+        <label style="font-size: 12px; color: #6b7280;">OpenAI API Key</label>
+        <div style="display: flex; gap: 8px; margin-top: 4px; align-items: center;">
+          <input type="password" id="memori-openai-key-input" placeholder="API key for Export Context" style="flex: 1; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 12px;">
+          <button id="memori-openai-key-save" style="padding: 8px 12px; background: #10a37f; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 12px;">Save</button>
+        </div>
+        <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" style="font-size: 11px; color: #10a37f; margin-top: 4px; display: block;">Get key at platform.openai.com</a>
+        <span id="memori-openai-key-status" style="font-size: 11px; color: #6b7280; margin-top: 4px; display: block;"></span>
+      </div>
     </div>
     <div id="memori-sidebar-tabs">
       <button class="memori-tab-btn active" data-tab="memories">Memories</button>
-      <button class="memori-tab-btn" data-tab="granola">Granola Recordings</button>
+      <button class="memori-tab-btn" data-tab="contexts">Context Handoffs</button>
+      <button class="memori-tab-btn" data-tab="granola">Granola</button>
     </div>
     <div id="memori-sidebar-content">
       <div id="memori-memories-panel" class="memori-tab-panel">
-        <div id="memori-export-context-bar">
-          <button id="memori-export-context-btn" class="memori-export-context-btn">Export chat context</button>
-        </div>
         <div id="memori-memories-list"></div>
       </div>
+      <div id="memori-contexts-panel" class="memori-tab-panel" style="display:none"></div>
       <div id="memori-granola-list" class="memori-tab-panel" style="display:none"></div>
     </div>
   `;
@@ -410,31 +562,6 @@ function createSidebar() {
         flex: 1;
         overflow-y: auto;
         padding: 0;
-      }
-      #memori-export-context-bar {
-        padding: 8px 12px 12px;
-        border-bottom: 1px solid #e5e7eb;
-        margin-bottom: 8px;
-      }
-      .memori-export-context-btn {
-        width: 100%;
-        padding: 8px 12px;
-        border: 1px solid #10a37f;
-        border-radius: 6px;
-        background: #ffffff;
-        color: #10a37f;
-        font-size: 13px;
-        font-weight: 500;
-        cursor: pointer;
-        font-family: inherit;
-        transition: all 0.2s;
-      }
-      .memori-export-context-btn:hover {
-        background: #ecfdf5;
-      }
-      .memori-export-context-btn:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
       }
       #memori-memories-list {
         padding: 12px;
@@ -548,7 +675,51 @@ function createSidebar() {
         padding: 12px;
       }
       #memori-memories-panel {
-        padding: 0;
+        padding: 12px;
+      }
+      .memori-context-item {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-left: 3px solid #8b5cf6;
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 12px;
+      }
+      .memori-context-item .memori-context-title {
+        font-weight: 600;
+        color: #111827;
+        font-size: 14px;
+        margin-bottom: 4px;
+      }
+      .memori-context-item .memori-context-meta {
+        font-size: 12px;
+        color: #6b7280;
+        margin-bottom: 8px;
+      }
+      .memori-context-item .memori-context-preview {
+        font-size: 13px;
+        color: #374151;
+        max-height: 80px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        margin-bottom: 8px;
+      }
+      .memori-context-item.expanded .memori-context-preview {
+        max-height: 300px;
+      }
+      .memori-context-expand-btn {
+        padding: 6px 12px;
+        border: none;
+        border-radius: 6px;
+        font-size: 12px;
+        cursor: pointer;
+        background: #e5e7eb;
+        color: #374151;
+        font-family: inherit;
+      }
+      .memori-context-expand-btn:hover {
+        background: #d1d5db;
       }
       .memori-granola-item {
         background: #ffffff;
@@ -705,53 +876,43 @@ function createSidebar() {
   // Tab switching
   const tabBtns = sidebar.querySelectorAll('.memori-tab-btn');
   const memoriesPanel = sidebar.querySelector('#memori-memories-panel');
+  const contextsPanel = sidebar.querySelector('#memori-contexts-panel');
   const granolaPanel = sidebar.querySelector('#memori-granola-list');
   tabBtns.forEach(btn => {
     btn.addEventListener('click', () => {
       const tab = btn.getAttribute('data-tab');
       tabBtns.forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
-      if (tab === 'memories') {
-        memoriesPanel.style.display = '';
-        granolaPanel.style.display = 'none';
-        loadMemoriesIntoSidebar();
-      } else {
-        memoriesPanel.style.display = 'none';
-        granolaPanel.style.display = '';
-        loadGranolaRecordings();
-      }
+      memoriesPanel.style.display = tab === 'memories' ? '' : 'none';
+      contextsPanel.style.display = tab === 'contexts' ? '' : 'none';
+      granolaPanel.style.display = tab === 'granola' ? '' : 'none';
+      if (tab === 'memories') loadMemoriesIntoSidebar();
+      else if (tab === 'contexts') loadContextHandoffsIntoSidebar();
+      else loadGranolaRecordings();
     });
   });
 
-  // Export context button
-  const exportBtn = sidebar.querySelector('#memori-export-context-btn');
-  if (exportBtn) {
-    exportBtn.addEventListener('click', async () => {
-      exportBtn.disabled = true;
-      exportBtn.textContent = 'Exporting...';
-      try {
-        const result = await exportChatContext();
-        if (result.success) {
-          exportBtn.textContent = `Context exported! (${result.messageCount} messages)`;
-          loadMemoriesIntoSidebar();
-          setTimeout(() => {
-            exportBtn.textContent = 'Export chat context';
-            exportBtn.disabled = false;
-          }, 2500);
-        } else {
-          exportBtn.textContent = result.error || 'Export failed';
-          setTimeout(() => {
-            exportBtn.textContent = 'Export chat context';
-            exportBtn.disabled = false;
-          }, 2000);
-        }
-      } catch (e) {
-        exportBtn.textContent = 'Export failed';
-        setTimeout(() => {
-          exportBtn.textContent = 'Export chat context';
-          exportBtn.disabled = false;
-        }, 2000);
+  // OpenAI API key settings
+  const openaiInput = sidebar.querySelector('#memori-openai-key-input');
+  const openaiSave = sidebar.querySelector('#memori-openai-key-save');
+  const openaiStatus = sidebar.querySelector('#memori-openai-key-status');
+  if (openaiInput && openaiSave) {
+    chrome.runtime.sendMessage({ action: 'getOpenAIApiKey' }).then(r => {
+      if (r?.key) {
+        openaiInput.placeholder = '••••••••••••';
+        openaiStatus.textContent = 'API key configured ✓';
       }
+    }).catch(() => {});
+    openaiSave.addEventListener('click', async () => {
+      const key = openaiInput.value?.trim();
+      if (!key) {
+        openaiStatus.textContent = 'Enter a key first';
+        return;
+      }
+      await chrome.runtime.sendMessage({ action: 'saveOpenAIApiKey', key });
+      openaiInput.value = '';
+      openaiInput.placeholder = '••••••••••••';
+      openaiStatus.textContent = 'API key configured ✓';
     });
   }
   
@@ -928,8 +1089,8 @@ function formatGranolaDate(dateStr) {
 
 // ========== Context Export ==========
 
-// Extract all messages from current ChatGPT conversation (in document order)
-function extractChatContext() {
+// Extract full conversation from ChatGPT DOM (for smart compression)
+function extractFullConversation() {
   const messages = [];
   const seen = new Set();
   const selectors = [
@@ -946,8 +1107,7 @@ function extractChatContext() {
     });
   }
   if (candidates.length === 0) {
-    const articles = document.querySelectorAll('article');
-    articles.forEach(article => {
+    document.querySelectorAll('article').forEach(article => {
       const userChild = article.querySelector('[data-message-author-role="user"]');
       const assistantChild = article.querySelector('[data-message-author-role="assistant"]');
       const role = userChild ? 'user' : (assistantChild ? 'assistant' : null);
@@ -965,17 +1125,19 @@ function extractChatContext() {
     if (seen.has(el)) continue;
     seen.add(el);
     let text = (el.innerText || el.textContent || '').trim();
-    const buttons = el.querySelectorAll('button');
-    buttons.forEach(btn => {
+    el.querySelectorAll('button').forEach(btn => {
       const btnText = btn.innerText || btn.textContent || '';
       if (btnText) text = text.replace(btnText, '').trim();
     });
     text = text.replace(/Copy code|Regenerate|Thumbs up|Thumbs down/gi, '').trim();
-    if (text) {
-      messages.push({ role, content: text });
-    }
+    if (text) messages.push({ role, content: text });
   }
   return messages;
+}
+
+// Alias for legacy export (chat_export)
+function extractChatContext() {
+  return extractFullConversation();
 }
 
 // Format messages into compact portable form
@@ -1074,6 +1236,63 @@ async function loadMemoriesIntoSidebar() {
   } catch (error) {
     console.error('Error loading memories:', error);
     listContainer.innerHTML = '<div class="memori-error">Error loading memories</div>';
+  }
+}
+
+// Load context handoffs and display in sidebar
+async function loadContextHandoffsIntoSidebar() {
+  if (!sidebarContainer) return;
+  const panel = sidebarContainer.querySelector('#memori-contexts-panel');
+  if (!panel) return;
+  try {
+    const contexts = await chrome.runtime.sendMessage({ action: 'getContextHandoffs' });
+    if (contexts.length === 0) {
+      panel.innerHTML = '<div class="memori-empty" style="padding: 40px 20px; text-align: center; color: #6b7280;">No context handoffs yet. Use "📋 Export Context" to compress a conversation.</div>';
+      return;
+    }
+    panel.innerHTML = contexts.map(ctx => `
+      <div class="memori-context-item" data-id="${ctx.id}">
+        <div class="memori-context-title">${escapeHtml(ctx.title || 'Context handoff')}</div>
+        <div class="memori-context-meta">${formatTime(ctx.timestamp)} · ${ctx.messageCount || 0} messages</div>
+        <div class="memori-context-preview">${escapeHtml((ctx.content || '').substring(0, 300))}${(ctx.content || '').length > 300 ? '...' : ''}</div>
+        <div class="memori-memory-actions">
+          <button class="memori-context-expand-btn" data-id="${ctx.id}">Expand</button>
+          <button class="memori-inject-btn" data-id="${ctx.id}">Inject</button>
+          <button class="memori-delete-btn memori-context-delete" data-id="${ctx.id}">Delete</button>
+        </div>
+      </div>
+    `).join('');
+    panel.style.padding = '12px';
+    const contextData = contexts;
+    panel.querySelectorAll('.memori-context-expand-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const item = e.target.closest('.memori-context-item');
+        const ctx = contextData.find(c => c.id === item.dataset.id);
+        if (ctx) {
+          const preview = item.querySelector('.memori-context-preview');
+          const isExpanded = item.classList.toggle('expanded');
+          const truncated = (ctx.content || '').substring(0, 300) + ((ctx.content || '').length > 300 ? '...' : '');
+          preview.textContent = isExpanded ? ctx.content : truncated;
+          btn.textContent = isExpanded ? 'Collapse' : 'Expand';
+        }
+      });
+    });
+    panel.querySelectorAll('.memori-inject-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const ctx = contextData.find(c => c.id === e.target.getAttribute('data-id'));
+        if (ctx) await injectMemory(ctx.content, ctx.id);
+      });
+    });
+    panel.querySelectorAll('.memori-context-delete').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const id = e.target.getAttribute('data-id');
+        const res = await chrome.runtime.sendMessage({ action: 'deleteContextHandoff', contextId: id });
+        if (res?.success) loadContextHandoffsIntoSidebar();
+      });
+    });
+  } catch (err) {
+    console.error('[Memori] Error loading context handoffs:', err);
+    panel.innerHTML = '<div class="memori-error">Error loading context handoffs</div>';
   }
 }
 
@@ -1575,12 +1794,13 @@ function initialize() {
   // Load settings
   loadSettings();
   
-  // Always inject button immediately (fixed position, doesn't need input)
-  if (!document.getElementById('memori-save-btn')) {
-    console.log('[Memori] Injecting save button immediately');
-    saveButton = createSaveButton();
-    document.body.appendChild(saveButton);
-    console.log('[Memori] Save button injected at', new Date().toISOString());
+  // Always inject button container immediately (fixed position, doesn't need input)
+  if (!document.getElementById('memori-button-container')) {
+    console.log('[Memori] Injecting button container immediately');
+    const container = createMemoriButtonContainer();
+    saveButton = container.querySelector('#memori-save-btn');
+    document.body.appendChild(container);
+    console.log('[Memori] Buttons injected at', new Date().toISOString());
   }
   
   // Wait for ChatGPT to load and find input
@@ -1594,9 +1814,9 @@ function initialize() {
       clearInterval(checkInterval);
       console.log('[Memori] Input found after', attempts, 'attempts:', input.tagName, input.id || input.className);
       
-      // Ensure button exists
-      if (!document.getElementById('memori-save-btn')) {
-        console.log('[Memori] Re-injecting button after input found');
+      // Ensure button container exists
+      if (!document.getElementById('memori-button-container')) {
+        console.log('[Memori] Re-injecting buttons after input found');
         injectSaveButton();
       }
       
@@ -1607,10 +1827,10 @@ function initialize() {
       
       // Re-inject if input changes (ChatGPT may dynamically update DOM)
       const observer = new MutationObserver(() => {
-        if (!document.getElementById('memori-save-btn')) {
+        if (!document.getElementById('memori-button-container')) {
           const newInput = findChatGPTInput();
           if (newInput) {
-            console.log('[Memori] Re-injecting button after DOM change');
+            console.log('[Memori] Re-injecting buttons after DOM change');
             injectSaveButton();
           }
         }
@@ -1649,11 +1869,12 @@ window.memoriDebug = function() {
     }
   });
   
-  // Force inject button
-  if (!document.getElementById('memori-save-btn')) {
-    console.log('Force injecting button...');
-    saveButton = createSaveButton();
-    document.body.appendChild(saveButton);
+  // Force inject button container
+  if (!document.getElementById('memori-button-container')) {
+    console.log('Force injecting buttons...');
+    const container = createMemoriButtonContainer();
+    saveButton = container.querySelector('#memori-save-btn');
+    document.body.appendChild(container);
   }
   
   // Force create and show sidebar
@@ -1705,7 +1926,7 @@ if (document.readyState === 'loading') {
 
 // Also try after a short delay to catch late-loading pages
 setTimeout(() => {
-  if (!document.getElementById('memori-save-btn')) {
+  if (!document.getElementById('memori-button-container')) {
     console.log('[Memori] Delayed initialization attempt');
     initialize();
   }

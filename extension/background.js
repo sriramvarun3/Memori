@@ -8,7 +8,11 @@ const GRANOLA_TOKEN_EXPIRY_KEY = 'granola_token_expiry';
 const MCP_ENDPOINT = 'https://mcp.granola.ai/mcp';
 const STORAGE_KEY = 'memori_memories';
 const SETTINGS_KEY = 'memori_settings';
+const CONTEXTS_KEY = 'memori_contexts';
+const OPENAI_API_KEY_KEY = 'openai_api_key';
 const MAX_CHAT_EXPORTS = 10;
+const MAX_CONTEXT_HANDOFFS = 10;
+const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 
 // Generate a simple UUID
 function generateId() {
@@ -102,6 +106,156 @@ async function deleteMemory(memoryId) {
     return { success: true };
   } catch (error) {
     console.error('Error deleting memory:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// ========== Smart Context Compression (OpenAI) ==========
+
+function parseOpenAIResponse(data) {
+  if (data.error) {
+    throw new Error(data.error.message || 'OpenAI API error');
+  }
+  const choice = data.choices?.[0];
+  if (choice?.message?.content) {
+    return choice.message.content.trim();
+  }
+  throw new Error('Unexpected OpenAI response format');
+}
+
+function extractProjectTitleFromCompression(compressedMarkdown) {
+  const match = compressedMarkdown.match(/### PROJECT\s*\n\[?([^\]]+)\]?|### PROJECT\s*\n(.+?)(?=\n###|$)/s);
+  if (match) {
+    const title = (match[1] || match[2] || '').trim();
+    return title.length > 80 ? title.substring(0, 77) + '...' : title;
+  }
+  return 'Context handoff';
+}
+
+async function compressContext(conversationArray, apiKey) {
+  const formattedTranscript = conversationArray.map(m => {
+    const label = m.role === 'user' ? 'User' : 'Assistant';
+    return `${label}: ${m.content}`;
+  }).join('\n\n');
+  const timestamp = new Date().toISOString();
+  const compressionPrompt = `You are a context compression assistant. Given the following conversation transcript, extract and compress it into a structured handoff format that another LLM can use to seamlessly continue the conversation.
+
+<conversation>
+${formattedTranscript}
+</conversation>
+
+Output the following structure in markdown. Be concise but preserve critical information. Omit sections if not applicable.
+
+## CONTEXT HANDOFF
+Generated: ${timestamp}
+
+### PROJECT
+[1-2 sentences: core topic/goal of this conversation]
+
+### USER PROFILE  
+- Communication style: [observed preferences - brief/detailed, technical level, tone]
+- Explicit instructions: [any direct requests about how to respond]
+
+### KEY DECISIONS
+[Bullet list of conclusions reached, choices made, things agreed upon]
+
+### CURRENT STATE
+[What was actively being worked on when conversation paused. Be specific.]
+
+### NEXT STEPS
+[What should happen next based on conversation flow]
+
+### OPEN QUESTIONS
+[Unresolved items, pending decisions, things user seemed uncertain about]
+
+### CRITICAL CONTEXT
+[Facts, constraints, or details that would be lost without explicit capture - project names, technical specs, deadlines, preferences expressed, etc.]
+
+---
+Compress now. Prioritize information density over completeness.`;
+
+  const makeRequest = () => fetch(OPENAI_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: compressionPrompt }],
+      max_tokens: 1500,
+      temperature: 0.3
+    })
+  });
+
+  let response = await makeRequest();
+  let data = await response.json();
+
+  // Retry once after 15s on rate limit
+  if (response.status === 429) {
+    await new Promise(r => setTimeout(r, 15000));
+    response = await makeRequest();
+    data = await response.json();
+  }
+
+  if (response.status === 429) {
+    throw new Error('Rate limit exceeded. Please wait a minute and try again.');
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw new Error(data.error?.message || 'Invalid API key. Get one at https://platform.openai.com/api-keys');
+  }
+  if (!response.ok) {
+    throw new Error(data.error?.message || `API error: ${response.status}`);
+  }
+
+  return parseOpenAIResponse(data);
+}
+
+async function saveContextHandoff(compressedMarkdown, messageCount) {
+  try {
+    const result = await chrome.storage.local.get([CONTEXTS_KEY]);
+    let contexts = result[CONTEXTS_KEY] || [];
+    const title = extractProjectTitleFromCompression(compressedMarkdown);
+    const newContext = {
+      id: generateId(),
+      type: 'context_handoff',
+      timestamp: Date.now(),
+      title,
+      content: compressedMarkdown,
+      messageCount,
+      source: 'chatgpt'
+    };
+    contexts.unshift(newContext);
+    if (contexts.length > MAX_CONTEXT_HANDOFFS) {
+      contexts = contexts.slice(0, MAX_CONTEXT_HANDOFFS);
+    }
+    await chrome.storage.local.set({ [CONTEXTS_KEY]: contexts });
+    return { success: true, context: newContext };
+  } catch (error) {
+    console.error('Error saving context handoff:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+async function getContextHandoffs() {
+  try {
+    const result = await chrome.storage.local.get([CONTEXTS_KEY]);
+    return result[CONTEXTS_KEY] || [];
+  } catch (error) {
+    console.error('Error getting context handoffs:', error);
+    return [];
+  }
+}
+
+async function deleteContextHandoff(contextId) {
+  try {
+    const result = await chrome.storage.local.get([CONTEXTS_KEY]);
+    let contexts = result[CONTEXTS_KEY] || [];
+    contexts = contexts.filter(c => c.id !== contextId);
+    await chrome.storage.local.set({ [CONTEXTS_KEY]: contexts });
+    return { success: true };
+  } catch (error) {
+    console.error('Error deleting context handoff:', error);
     return { success: false, error: error.message };
   }
 }
@@ -629,6 +783,59 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'granolaGetMeetingDetails') {
     granolaGetMeetingDetails(request.meetingId).then(sendResponse);
+    return true;
+  }
+
+  if (request.action === 'compressAndSaveContext') {
+    (async () => {
+      try {
+        const { openai_api_key } = await chrome.storage.local.get([OPENAI_API_KEY_KEY]);
+        if (!openai_api_key || !openai_api_key.trim()) {
+          sendResponse({ success: false, error: 'API key required', needsApiKey: true });
+          return;
+        }
+        const msgCount = request.conversation?.length || 0;
+        let compressed;
+        try {
+          compressed = await compressContext(request.conversation, openai_api_key.trim());
+        } catch (err) {
+          const rawTranscript = request.conversation.map(m => {
+            const label = m.role === 'user' ? 'User' : 'Assistant';
+            return `${label}: ${m.content}`;
+          }).join('\n\n');
+          compressed = `## CONTEXT HANDOFF (Compression failed)\n\n**Error:** ${err.message}\n\n### Raw transcript\n\n${rawTranscript}`;
+        }
+        const saveResult = await saveContextHandoff(compressed, msgCount);
+        if (saveResult.success) {
+          sendResponse({ success: true, messageCount: msgCount, context: saveResult.context });
+        } else {
+          sendResponse({ success: false, error: saveResult.error });
+        }
+      } catch (err) {
+        console.error('[Memori] compressAndSaveContext error:', err);
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true;
+  }
+
+  if (request.action === 'getContextHandoffs') {
+    getContextHandoffs().then(sendResponse);
+    return true;
+  }
+
+  if (request.action === 'deleteContextHandoff') {
+    deleteContextHandoff(request.contextId).then(sendResponse);
+    return true;
+  }
+
+  if (request.action === 'getOpenAIApiKey') {
+    chrome.storage.local.get([OPENAI_API_KEY_KEY]).then(r => sendResponse({ key: r[OPENAI_API_KEY_KEY] || '' }));
+    return true;
+  }
+
+  if (request.action === 'saveOpenAIApiKey') {
+    chrome.storage.local.set({ [OPENAI_API_KEY_KEY]: request.key || '' }).then(() => sendResponse({ success: true }));
     return true;
   }
 
