@@ -313,8 +313,13 @@ function createSidebar() {
         <span>Auto-capture sent messages</span>
       </label>
     </div>
+    <div id="memori-sidebar-tabs">
+      <button class="memori-tab-btn active" data-tab="memories">Memories</button>
+      <button class="memori-tab-btn" data-tab="granola">Granola Recordings</button>
+    </div>
     <div id="memori-sidebar-content">
-      <div id="memori-memories-list"></div>
+      <div id="memori-memories-list" class="memori-tab-panel"></div>
+      <div id="memori-granola-list" class="memori-tab-panel" style="display:none"></div>
     </div>
   `;
   
@@ -477,6 +482,122 @@ function createSidebar() {
       #memori-sidebar-content::-webkit-scrollbar-thumb:hover {
         background: #a8a8a8;
       }
+      #memori-sidebar-tabs {
+        display: flex;
+        border-bottom: 1px solid #e5e7eb;
+        background: #f9fafb;
+      }
+      .memori-tab-btn {
+        flex: 1;
+        padding: 10px 16px;
+        border: none;
+        background: transparent;
+        font-size: 13px;
+        font-weight: 500;
+        color: #6b7280;
+        cursor: pointer;
+        font-family: inherit;
+        transition: all 0.2s;
+      }
+      .memori-tab-btn:hover {
+        color: #111827;
+        background: #f3f4f6;
+      }
+      .memori-tab-btn.active {
+        color: #10a37f;
+        background: #ffffff;
+        border-bottom: 2px solid #10a37f;
+      }
+      .memori-tab-panel {
+        padding: 12px;
+      }
+      .memori-granola-item {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 12px;
+        transition: box-shadow 0.2s;
+      }
+      .memori-granola-item:hover {
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      }
+      .memori-granola-title {
+        font-weight: 600;
+        color: #111827;
+        font-size: 14px;
+        margin-bottom: 6px;
+      }
+      .memori-granola-meta {
+        font-size: 12px;
+        color: #6b7280;
+        margin-bottom: 8px;
+      }
+      .memori-granola-actions {
+        display: flex;
+        gap: 8px;
+      }
+      .memori-granola-inject-btn {
+        padding: 6px 12px;
+        border: none;
+        border-radius: 6px;
+        font-size: 12px;
+        cursor: pointer;
+        font-weight: 500;
+        background: #10a37f;
+        color: white;
+        font-family: inherit;
+      }
+      .memori-granola-inject-btn:hover {
+        background: #0d8c6d;
+      }
+      .memori-granola-connect-btn {
+        padding: 10px 20px;
+        border: none;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+        background: #10a37f;
+        color: white;
+        font-family: inherit;
+        width: 100%;
+      }
+      .memori-granola-connect-btn:hover {
+        background: #0d8c6d;
+      }
+      .memori-granola-loading {
+        padding: 40px 20px;
+        text-align: center;
+        color: #6b7280;
+        font-size: 14px;
+      }
+      .memori-granola-notes {
+        font-size: 13px;
+        color: #374151;
+        line-height: 1.5;
+        margin-top: 8px;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        max-height: 120px;
+        overflow: hidden;
+        transition: max-height 0.3s ease;
+      }
+      .memori-granola-notes.expanded {
+        max-height: none;
+      }
+      .memori-granola-see-more {
+        background: none;
+        border: none;
+        color: #10a37f;
+        font-size: 12px;
+        cursor: pointer;
+        padding: 4px 0;
+        font-family: inherit;
+      }
+      .memori-granola-see-more:hover {
+        text-decoration: underline;
+      }
     `;
     document.head.appendChild(style);
   }
@@ -541,8 +662,197 @@ function createSidebar() {
       }
     });
   }
+
+  // Tab switching
+  const tabBtns = sidebar.querySelectorAll('.memori-tab-btn');
+  const memoriesPanel = sidebar.querySelector('#memori-memories-list');
+  const granolaPanel = sidebar.querySelector('#memori-granola-list');
+  tabBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tab = btn.getAttribute('data-tab');
+      tabBtns.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      if (tab === 'memories') {
+        memoriesPanel.style.display = '';
+        granolaPanel.style.display = 'none';
+        loadMemoriesIntoSidebar();
+      } else {
+        memoriesPanel.style.display = 'none';
+        granolaPanel.style.display = '';
+        loadGranolaRecordings();
+      }
+    });
+  });
   
   return sidebar;
+}
+
+// Load Granola recordings and display in sidebar
+async function loadGranolaRecordings() {
+  if (!sidebarContainer) return;
+  
+  const listContainer = sidebarContainer.querySelector('#memori-granola-list');
+  if (!listContainer) return;
+  
+  listContainer.innerHTML = '<div class="memori-granola-loading">Loading...</div>';
+  
+  try {
+    const authResult = await chrome.runtime.sendMessage({ action: 'granolaCheckAuth' });
+    
+    if (!authResult.authenticated) {
+      listContainer.innerHTML = `
+        <div class="memori-empty">
+          <p style="margin-bottom: 16px;">Connect your Granola account to view meeting recordings.</p>
+          <button class="memori-granola-connect-btn" id="memori-granola-connect">Connect to Granola</button>
+        </div>
+      `;
+      const connectBtn = listContainer.querySelector('#memori-granola-connect');
+      if (connectBtn) {
+        connectBtn.addEventListener('click', async () => {
+          connectBtn.disabled = true;
+          connectBtn.textContent = 'Connecting...';
+          const result = await chrome.runtime.sendMessage({ action: 'granolaAuthenticate' });
+          connectBtn.disabled = false;
+          connectBtn.textContent = 'Connect to Granola';
+          if (result.success) {
+            loadGranolaRecordings();
+          } else {
+            listContainer.innerHTML = `
+              <div class="memori-error">
+                <p>${escapeHtml(result.error || 'Authentication failed')}</p>
+                <button class="memori-granola-connect-btn" id="memori-granola-retry" style="margin-top: 12px;">Retry</button>
+              </div>
+            `;
+            listContainer.querySelector('#memori-granola-retry')?.addEventListener('click', () => loadGranolaRecordings());
+          }
+        });
+      }
+      return;
+    }
+    
+    const { meetings, error } = await chrome.runtime.sendMessage({ action: 'granolaGetMeetings' });
+    
+    if (error) {
+      listContainer.innerHTML = `
+        <div class="memori-error">
+          <p>${escapeHtml(error)}</p>
+          <button class="memori-granola-connect-btn" id="memori-granola-reconnect" style="margin-top: 12px;">Reconnect</button>
+        </div>
+      `;
+      listContainer.querySelector('#memori-granola-reconnect')?.addEventListener('click', async () => {
+        const result = await chrome.runtime.sendMessage({ action: 'granolaAuthenticate' });
+        if (result.success) {
+          loadGranolaRecordings();
+        } else {
+          listContainer.querySelector('p').textContent = result.error || 'Reconnection failed';
+        }
+      });
+      return;
+    }
+    
+    if (!meetings || meetings.length === 0) {
+      listContainer.innerHTML = '<div class="memori-empty">No recordings found.</div>';
+      return;
+    }
+    
+    const COLLAPSE_LENGTH = 200;
+    listContainer.innerHTML = meetings.map((meeting, idx) => {
+      const id = meeting.id || meeting.meeting_id || meeting.meetingId || String(idx);
+      const title = meeting.title || meeting.name || meeting.subject || 'Untitled Meeting';
+      const date = meeting.date || meeting.meeting_date || meeting.created_at || meeting.start_time || '';
+      const attendees = meeting.attendees || meeting.participants || [];
+      const attendeesStr = Array.isArray(attendees) ? attendees.join(', ') : (attendees || '');
+      const dateStr = date ? (typeof date === 'string' ? formatGranolaDate(date) : formatGranolaDate(new Date(date).toISOString())) : '';
+      const notes = meeting.notes || meeting.content || meeting.raw || meeting.summary_text || meeting.summary_markdown || '';
+      const notesDisplay = String(notes).trim();
+      const isLong = notesDisplay.length > COLLAPSE_LENGTH;
+      const shortNotes = isLong ? notesDisplay.substring(0, COLLAPSE_LENGTH) + '...' : notesDisplay;
+      
+      return `
+        <div class="memori-granola-item" data-meeting-id="${escapeHtml(id)}" data-meeting-index="${idx}">
+          <div class="memori-granola-title">${escapeHtml(title)}</div>
+          <div class="memori-granola-meta">
+            ${dateStr ? `<span>${dateStr}</span>` : ''}
+            ${attendeesStr ? `<br><span>${escapeHtml(attendeesStr)}</span>` : ''}
+          </div>
+          ${notesDisplay ? `
+            <div class="memori-granola-notes">${escapeHtml(shortNotes)}</div>
+            ${isLong ? '<button class="memori-granola-see-more" type="button">See more</button>' : ''}
+          ` : ''}
+          <div class="memori-granola-actions">
+            <button class="memori-granola-inject-btn" data-meeting-id="${escapeHtml(id)}" data-meeting-index="${idx}">Inject</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    listContainer.querySelectorAll('.memori-granola-see-more').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const item = btn.closest('.memori-granola-item');
+        const notesEl = item?.querySelector('.memori-granola-notes');
+        if (!notesEl) return;
+        const idx = parseInt(item?.getAttribute('data-meeting-index') || '0', 10);
+        const meeting = meetings[idx];
+        const fullNotes = meeting?.notes || meeting?.content || meeting?.raw || meeting?.summary_text || meeting?.summary_markdown || '';
+        const isExpanded = notesEl.classList.contains('expanded');
+        if (isExpanded) {
+          const short = fullNotes.length > COLLAPSE_LENGTH ? fullNotes.substring(0, COLLAPSE_LENGTH) + '...' : fullNotes;
+          notesEl.textContent = short;
+          notesEl.classList.remove('expanded');
+          btn.textContent = 'See more';
+        } else {
+          notesEl.textContent = fullNotes;
+          notesEl.classList.add('expanded');
+          btn.textContent = 'See less';
+        }
+      });
+    });
+
+    listContainer.querySelectorAll('.memori-granola-inject-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const item = e.target.closest('.memori-granola-item');
+        const idx = parseInt(item?.getAttribute('data-meeting-index') || '0', 10);
+        const meeting = meetings[idx];
+        let textToInject = meeting?.notes || meeting?.content || meeting?.raw || meeting?.summary_text || meeting?.summary_markdown || '';
+        if (!textToInject) {
+          const meetingId = e.target.getAttribute('data-meeting-id');
+          const result = await chrome.runtime.sendMessage({ action: 'granolaGetMeetingDetails', meetingId });
+          if (result.error) {
+            alert('Could not load meeting: ' + result.error);
+            return;
+          }
+          textToInject = result.meeting || '';
+        }
+        if (textToInject) {
+          await injectMemory(textToInject, null);
+          btn.textContent = 'Injected!';
+          btn.style.background = '#059669';
+          setTimeout(() => {
+            btn.textContent = 'Inject';
+            btn.style.background = '';
+          }, 1000);
+        }
+      });
+    });
+    
+  } catch (err) {
+    console.error('[Memori] Error loading Granola recordings:', err);
+    listContainer.innerHTML = '<div class="memori-error">Error loading recordings</div>';
+  }
+}
+
+function formatGranolaDate(dateStr) {
+  try {
+    const date = new Date(dateStr);
+    const now = new Date();
+    const diff = now - date;
+    if (diff < 86400000) return 'Today';
+    if (diff < 172800000) return 'Yesterday';
+    if (diff < 604800000) return `${Math.floor(diff / 86400000)} days ago`;
+    return date.toLocaleDateString();
+  } catch (_) {
+    return dateStr;
+  }
 }
 
 // Load memories and display in sidebar
