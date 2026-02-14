@@ -5,6 +5,7 @@ const MAX_MEMORIES = 50;
 const GRANOLA_TOKEN_KEY = 'granola_access_token';
 const GRANOLA_REFRESH_KEY = 'granola_refresh_token';
 const GRANOLA_TOKEN_EXPIRY_KEY = 'granola_token_expiry';
+const GRANOLA_MEETINGS_CACHE_KEY = 'memori_granola_meetings_cache';
 const MCP_ENDPOINT = 'https://mcp.granola.ai/mcp';
 const STORAGE_KEY = 'memori_memories';
 const SETTINGS_KEY = 'memori_settings';
@@ -732,6 +733,32 @@ async function granolaGetMeetingDetails(meetingId) {
   }
 }
 
+// Get cached Granola meetings (no API call)
+async function getGranolaMeetingsCached() {
+  try {
+    const result = await chrome.storage.local.get([GRANOLA_MEETINGS_CACHE_KEY]);
+    const cached = result[GRANOLA_MEETINGS_CACHE_KEY];
+    return { meetings: cached?.meetings || [], cachedAt: cached?.cachedAt || null };
+  } catch (error) {
+    console.error('[Memori] Error getting Granola cache:', error);
+    return { meetings: [], cachedAt: null };
+  }
+}
+
+// Fetch from Granola API and update cache
+async function granolaFetchAndCacheMeetings(dateFrom, dateTo) {
+  const result = await granolaGetMeetings(dateFrom, dateTo);
+  if (!result.error && result.meetings) {
+    await chrome.storage.local.set({
+      [GRANOLA_MEETINGS_CACHE_KEY]: {
+        meetings: result.meetings,
+        cachedAt: Date.now()
+      }
+    });
+  }
+  return result;
+}
+
 // Listen for messages from content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'saveMemory') {
@@ -778,6 +805,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'granolaGetMeetings') {
     granolaGetMeetings(request.dateFrom, request.dateTo).then(sendResponse);
+    return true;
+  }
+
+  if (request.action === 'getGranolaMeetingsCached') {
+    getGranolaMeetingsCached().then(sendResponse);
+    return true;
+  }
+
+  if (request.action === 'granolaFetchAndCacheMeetings') {
+    granolaFetchAndCacheMeetings(request.dateFrom, request.dateTo).then(sendResponse);
     return true;
   }
 
