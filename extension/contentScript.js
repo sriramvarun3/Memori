@@ -16,6 +16,8 @@ const INPUT_SELECTORS = [
   'textarea#prompt-textarea',
   'textarea[data-testid="chat-input"]',
   'div.ProseMirror[contenteditable="true"]',
+  'div.ql-editor[contenteditable="true"]',
+  'div[contenteditable="true"][aria-label*="gemini" i]',
   'div[contenteditable="true"][aria-label*="message" i]',
   'textarea[placeholder*="Message"]',
   'textarea[placeholder*="message" i]',
@@ -30,6 +32,8 @@ const INPUT_SELECTORS = [
 const SEND_BUTTON_SELECTORS = [
   'button[data-testid*="send"]',
   'button[data-testid="send-button"]',
+  'button[aria-label*="Send to Gemini" i]',
+  'button[aria-label*="Run" i]',
   'button[aria-label*="Send message" i]',
   'button[aria-label*="Send" i]',
   'button[aria-label*="send" i]',
@@ -1394,8 +1398,8 @@ function inferMessageRole(el) {
     el.id || ''
   ].join(' ').toLowerCase();
 
-  if (/(^|[\s_-])(user|human)([\s_-]|$)/.test(haystack)) return 'user';
-  if (/(^|[\s_-])(assistant|claude|model|ai)([\s_-]|$)/.test(haystack)) return 'assistant';
+  if (/(^|[\s_-])(user|human|query|prompt)([\s_-]|$)/.test(haystack)) return 'user';
+  if (/(^|[\s_-])(assistant|claude|model|ai|gemini|bard|response)([\s_-]|$)/.test(haystack)) return 'assistant';
   return null;
 }
 
@@ -1411,6 +1415,9 @@ function extractFullConversation() {
     '[data-testid*="assistant-message"]',
     '[data-testid*="message"]',
     '[data-testid*="chat-turn"]',
+    '[class*="user-query"]',
+    '[class*="model-response"]',
+    '[class*="response-content"]',
     'article',
     'div[class*="message"]'
   ];
@@ -1419,7 +1426,7 @@ function extractFullConversation() {
     document.querySelectorAll(selector).forEach(el => {
       if (!isElementVisible(el)) return;
       const container = el.closest(
-        '[data-message-author-role],[data-testid*="message"],[data-testid*="chat-turn"],article,div[class*="message"]'
+        '[data-message-author-role],[data-testid*="message"],[data-testid*="chat-turn"],[class*="user-query"],[class*="model-response"],[class*="response-content"],article,div[class*="message"]'
       ) || el;
       const role = inferMessageRole(container) || inferMessageRole(el);
       candidates.push({ el: container, role });
