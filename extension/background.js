@@ -1005,7 +1005,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // Handle extension icon click
 chrome.action.onClicked.addListener((tab) => {
   // Only work on supported AI chat pages
-  if (tab.url && (tab.url.includes('chat.openai.com') || tab.url.includes('chatgpt.com') || tab.url.includes('claude.ai'))) {
+  if (tab.url && (tab.url.includes('chat.openai.com') || tab.url.includes('chatgpt.com') || tab.url.includes('claude.ai') || tab.url.includes('gemini.google.com'))) {
     chrome.tabs.sendMessage(tab.id, { action: 'toggleSidebar' }).catch(err => {
       console.error('[Memori] Error sending message to content script:', err);
     });
