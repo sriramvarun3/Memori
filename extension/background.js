@@ -1004,12 +1004,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 // Handle extension icon click
 chrome.action.onClicked.addListener((tab) => {
-  // Only work on ChatGPT pages
-  if (tab.url && (tab.url.includes('chat.openai.com') || tab.url.includes('chatgpt.com'))) {
+  // Only work on supported AI chat pages
+  if (tab.url && (tab.url.includes('chat.openai.com') || tab.url.includes('chatgpt.com') || tab.url.includes('claude.ai'))) {
     chrome.tabs.sendMessage(tab.id, { action: 'toggleSidebar' }).catch(err => {
       console.error('[Memori] Error sending message to content script:', err);
     });
   } else {
-    console.log('[Memori] Not a ChatGPT page:', tab.url);
+    console.log('[Memori] Not a supported chat page:', tab.url);
   }
 });

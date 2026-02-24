@@ -7,6 +7,7 @@
   "host_permissions": [
     "https://chat.openai.com/*",
     "https://www.chatgpt.com/*",
+    "https://claude.ai/*",
     "https://mcp.granola.ai/*",
     "https://*.granola.ai/*",
     "https://api.openai.com/*"
@@ -20,7 +21,9 @@
         "https://chat.openai.com/*",
         "https://www.chatgpt.com/*",
         "https://*.chatgpt.com/*",
-        "https://*.openai.com/*"
+        "https://*.openai.com/*",
+        "https://claude.ai/*",
+        "https://*.claude.ai/*"
       ],
       "js": ["contentScript.js"],
       "run_at": "document_idle",
@@ -33,7 +36,7 @@
   "web_accessible_resources": [
     {
       "resources": ["sidebar.css", "sidebar.js"],
-      "matches": ["https://chat.openai.com/*", "https://www.chatgpt.com/*"]
+      "matches": ["https://chat.openai.com/*", "https://www.chatgpt.com/*", "https://claude.ai/*"]
     }
   ]
 }
