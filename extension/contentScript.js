@@ -7,6 +7,8 @@ let sidebarVisible = false;
 let sidebarContainer = null;
 let saveButton = null;
 let autoCaptureEnabled = false;
+let mSendButton = null;
+let mSendInProgress = false;
 
 // ChatGPT input selectors (may need updates if ChatGPT changes their DOM)
 const INPUT_SELECTORS = [
@@ -20,6 +22,15 @@ const INPUT_SELECTORS = [
   'textarea[data-testid*="input"]',
   'textarea',
   'div[contenteditable="true"]'
+];
+
+const SEND_BUTTON_SELECTORS = [
+  'button[data-testid*="send"]',
+  'button[aria-label*="Send" i]',
+  'button[aria-label*="send" i]',
+  'button:has(svg[data-testid*="send"])',
+  'form button[type="submit"]',
+  'button[type="submit"]'
 ];
 
 // Check if element is visible
@@ -80,6 +91,23 @@ function findChatGPTInput() {
   }
   
   console.warn('[Memori] No input element found');
+  return null;
+}
+
+// Find ChatGPT send button
+function findChatGPTSendButton() {
+  for (const selector of SEND_BUTTON_SELECTORS) {
+    try {
+      const candidates = document.querySelectorAll(selector);
+      for (const el of candidates) {
+        if (isElementVisible(el) && !el.disabled) {
+          return el;
+        }
+      }
+    } catch (_) {
+      // Ignore invalid selectors in changing DOMs
+    }
+  }
   return null;
 }
 
@@ -244,6 +272,144 @@ function showApiKeyModal() {
       }
     });
   });
+}
+
+function setChatGPTInputText(input, text) {
+  if (!input) return false;
+
+  if (input.tagName === 'TEXTAREA') {
+    input.focus();
+    input.value = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }
+
+  if (input.contentEditable === 'true' || input.isContentEditable) {
+    input.focus();
+    input.innerText = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }
+
+  return false;
+}
+
+function triggerChatGPTSend(input) {
+  const sendBtn = findChatGPTSendButton();
+  if (sendBtn) {
+    sendBtn.click();
+    return true;
+  }
+
+  if (input) {
+    const enterEvent = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      code: 'Enter',
+      which: 13,
+      keyCode: 13,
+      bubbles: true
+    });
+    input.dispatchEvent(enterEvent);
+    return true;
+  }
+
+  return false;
+}
+
+async function handleGranolaGroundedMSend() {
+  if (mSendInProgress) return;
+
+  const input = findChatGPTInput();
+  if (!input) {
+    alert('Could not find ChatGPT input');
+    return;
+  }
+
+  const userQuery = extractTextFromInput(input);
+  if (!userQuery) {
+    alert('Type a message first');
+    return;
+  }
+
+  mSendInProgress = true;
+  if (mSendButton) {
+    mSendButton.disabled = true;
+    mSendButton.textContent = 'M...';
+  }
+
+  try {
+    const result = await chrome.runtime.sendMessage({
+      action: 'granolaGroundedComposePrompt',
+      userQuery
+    });
+
+    if (!result?.success || !result.composedPrompt) {
+      alert(result?.error || 'Could not prepare grounded prompt');
+      return;
+    }
+
+    const didSet = setChatGPTInputText(input, result.composedPrompt);
+    if (!didSet) {
+      alert('Could not write grounded prompt into ChatGPT input');
+      return;
+    }
+
+    // Give ChatGPT editor a tick to reconcile the input update.
+    setTimeout(() => {
+      triggerChatGPTSend(input);
+    }, 50);
+  } catch (error) {
+    console.error('[Memori] M-send failed:', error);
+    alert(error.message || 'M-send failed');
+  } finally {
+    mSendInProgress = false;
+    if (mSendButton) {
+      mSendButton.disabled = false;
+      mSendButton.textContent = 'M';
+    }
+  }
+}
+
+function createMSendButton() {
+  const button = document.createElement('button');
+  button.id = 'memori-m-send-btn';
+  button.type = 'button';
+  button.textContent = 'M';
+  button.title = 'Ground with Granola and send';
+  button.style.cssText = `
+    margin-right: 8px;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    border: 1px solid #10a37f;
+    background: #ffffff;
+    color: #10a37f;
+    font-weight: 700;
+    cursor: pointer;
+    font-size: 13px;
+  `;
+  button.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    handleGranolaGroundedMSend();
+  });
+  return button;
+}
+
+function injectMSendButtonNearSend() {
+  const sendBtn = findChatGPTSendButton();
+  if (!sendBtn) return;
+
+  const existing = document.getElementById('memori-m-send-btn');
+  if (existing && existing.parentElement && existing.parentElement.contains(sendBtn)) {
+    mSendButton = existing;
+    return;
+  }
+  if (existing) existing.remove();
+
+  const mBtn = createMSendButton();
+  sendBtn.parentElement?.insertBefore(mBtn, sendBtn);
+  mSendButton = mBtn;
 }
 
 // Create "Save to memory" button
@@ -1783,16 +1949,6 @@ async function autoCaptureAssistantResponse() {
 
 // Setup auto-capture listeners
 function setupAutoCapture() {
-  // Find send button selectors (ChatGPT uses various patterns)
-  const sendButtonSelectors = [
-    'button[data-testid*="send"]',
-    'button[aria-label*="Send" i]',
-    'button[aria-label*="send" i]',
-    'button:has(svg[data-testid*="send"])',
-    'form button[type="submit"]',
-    'button[type="submit"]'
-  ];
-  
   // Listen for form submissions
   document.addEventListener('submit', (e) => {
     console.log('[Memori] Form submitted, auto-capturing...');
@@ -1814,7 +1970,7 @@ function setupAutoCapture() {
   
   // Listen for send button clicks - capture on mousedown to get text before click clears it
   const observeSendButtons = () => {
-    sendButtonSelectors.forEach(selector => {
+    SEND_BUTTON_SELECTORS.forEach(selector => {
       try {
         const buttons = document.querySelectorAll(selector);
         buttons.forEach(button => {
@@ -1837,6 +1993,7 @@ function setupAutoCapture() {
         // Selector might not be valid, skip
       }
     });
+    injectMSendButtonNearSend();
   };
   
   // Initial check
@@ -1924,6 +2081,7 @@ function initialize() {
     document.body.appendChild(container);
     console.log('[Memori] Buttons injected at', new Date().toISOString());
   }
+  injectMSendButtonNearSend();
   
   // Wait for ChatGPT to load and find input
   let attempts = 0;
@@ -1941,6 +2099,7 @@ function initialize() {
         console.log('[Memori] Re-injecting buttons after input found');
         injectSaveButton();
       }
+      injectMSendButtonNearSend();
       
       // Setup auto-capture if enabled
       if (autoCaptureEnabled) {
@@ -1956,6 +2115,7 @@ function initialize() {
             injectSaveButton();
           }
         }
+        injectMSendButtonNearSend();
       });
       
       observer.observe(document.body, {

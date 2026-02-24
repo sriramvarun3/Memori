@@ -733,6 +733,102 @@ async function granolaGetMeetingDetails(meetingId) {
   }
 }
 
+function extractMcpToolText(toolResult) {
+  if (!toolResult) return '';
+  if (typeof toolResult === 'string') return toolResult.trim();
+  if (Array.isArray(toolResult.content)) {
+    const textParts = toolResult.content
+      .filter(c => c && c.type === 'text' && typeof c.text === 'string')
+      .map(c => c.text.trim())
+      .filter(Boolean);
+    if (textParts.length > 0) return textParts.join('\n\n');
+  }
+  if (typeof toolResult.text === 'string') return toolResult.text.trim();
+  return '';
+}
+
+function selectGranolaChatTool(tools) {
+  if (!Array.isArray(tools)) return null;
+  const preferred = tools.find(t => t?.name === 'query_granola_meetings');
+  if (preferred) return preferred;
+  const exact = tools.find(t => t?.name === 'chat_with_granola');
+  if (exact) return exact;
+  const fuzzy = tools.find(t => {
+    const n = (t?.name || '').toLowerCase();
+    return n.includes('chat') && n.includes('granola');
+  });
+  if (fuzzy) return fuzzy;
+  return tools.find(t => (t?.name || '').toLowerCase().includes('chat')) || null;
+}
+
+function buildChatToolArgs(toolDef, question) {
+  const schemaProps = toolDef?.inputSchema?.properties || {};
+  const preferredKeys = ['query', 'question', 'prompt', 'message', 'input', 'text'];
+  const key = preferredKeys.find(k => Object.prototype.hasOwnProperty.call(schemaProps, k)) || 'query';
+  return { [key]: question };
+}
+
+async function granolaChatWithGranola(userQuery) {
+  const token = await getGranolaToken();
+  if (!token) return { error: 'Not authenticated', needsAuth: true };
+
+  try {
+    const initResult = await mcpRequest('initialize', {
+      protocolVersion: '2025-03-26',
+      capabilities: {},
+      clientInfo: { name: 'Memori', version: '1.0.0' }
+    }, token);
+    if (initResult && initResult.needsAuth) {
+      return { error: 'Session expired. Please reconnect.', needsAuth: true };
+    }
+
+    const toolsList = await mcpRequest('tools/list', {}, token);
+    const chatTool = selectGranolaChatTool(toolsList?.tools || []);
+    if (!chatTool?.name) {
+      return { error: 'Granola chat tool not found in MCP tools/list.' };
+    }
+
+    const question = [
+      'Use my Granola meeting context to answer this user request.',
+      `User request: ${userQuery}`,
+      'If relevant context is missing, say that explicitly.'
+    ].join('\n');
+
+    // Exactly one chat tool call.
+    const toolResult = await mcpRequest('tools/call', {
+      name: chatTool.name,
+      arguments: buildChatToolArgs(chatTool, question)
+    }, token);
+
+    const contextText = extractMcpToolText(toolResult);
+    if (!contextText) {
+      return { error: 'Granola returned no context text.' };
+    }
+    return { contextText };
+  } catch (error) {
+    console.error('[Memori] Granola chat call failed:', error);
+    return { error: error.message };
+  }
+}
+
+function composeGranolaGroundedPrompt(userQuery, granolaContext) {
+  return [
+    'You are answering the user by grounding in the provided Granola context.',
+    '',
+    '## User Original Query',
+    userQuery,
+    '',
+    '## Granola Context',
+    granolaContext,
+    '',
+    '## Instructions',
+    '- Answer the user query directly.',
+    '- Ground your response in the Granola Context above.',
+    '- If the context is insufficient or uncertain, say so explicitly.',
+    '- Do not fabricate details not supported by the context.'
+  ].join('\n');
+}
+
 // Get cached Granola meetings (no API call)
 async function getGranolaMeetingsCached() {
   try {
@@ -800,6 +896,33 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'granolaCheckAuth') {
     granolaCheckAuth().then(sendResponse);
+    return true;
+  }
+
+  if (request.action === 'granolaGroundedComposePrompt') {
+    (async () => {
+      const userQuery = (request.userQuery || '').trim();
+      if (!userQuery) {
+        sendResponse({ success: false, error: 'User query is empty.' });
+        return;
+      }
+      let granolaResult = await granolaChatWithGranola(userQuery);
+      if (granolaResult.needsAuth) {
+        const auth = await granolaAuthenticate();
+        if (!auth.success) {
+          sendResponse({ success: false, error: auth.error || 'Granola authentication failed.' });
+          return;
+        }
+        // Retry exactly once after successful auth.
+        granolaResult = await granolaChatWithGranola(userQuery);
+      }
+      if (granolaResult.error) {
+        sendResponse({ success: false, error: granolaResult.error });
+        return;
+      }
+      const composedPrompt = composeGranolaGroundedPrompt(userQuery, granolaResult.contextText);
+      sendResponse({ success: true, composedPrompt });
+    })();
     return true;
   }
 
