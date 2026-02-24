@@ -14,6 +14,9 @@ let mSendInProgress = false;
 const INPUT_SELECTORS = [
   'textarea[data-id="root"]',
   'textarea#prompt-textarea',
+  'textarea[data-testid="chat-input"]',
+  'div.ProseMirror[contenteditable="true"]',
+  'div[contenteditable="true"][aria-label*="message" i]',
   'textarea[placeholder*="Message"]',
   'textarea[placeholder*="message" i]',
   'textarea[aria-label*="message" i]',
@@ -26,6 +29,8 @@ const INPUT_SELECTORS = [
 
 const SEND_BUTTON_SELECTORS = [
   'button[data-testid*="send"]',
+  'button[data-testid="send-button"]',
+  'button[aria-label*="Send message" i]',
   'button[aria-label*="Send" i]',
   'button[aria-label*="send" i]',
   'button:has(svg[data-testid*="send"])',
@@ -1377,38 +1382,56 @@ function formatGranolaDate(dateStr) {
 
 // ========== Context Export ==========
 
+function inferMessageRole(el) {
+  if (!el) return null;
+  const attrRole = (el.getAttribute('data-message-author-role') || '').toLowerCase();
+  if (attrRole === 'user' || attrRole === 'assistant') return attrRole;
+
+  const haystack = [
+    el.getAttribute('data-testid') || '',
+    el.getAttribute('aria-label') || '',
+    el.className || '',
+    el.id || ''
+  ].join(' ').toLowerCase();
+
+  if (/(^|[\s_-])(user|human)([\s_-]|$)/.test(haystack)) return 'user';
+  if (/(^|[\s_-])(assistant|claude|model|ai)([\s_-]|$)/.test(haystack)) return 'assistant';
+  return null;
+}
+
 // Extract full conversation from ChatGPT DOM (for smart compression)
 function extractFullConversation() {
   const messages = [];
   const seen = new Set();
+  const candidates = [];
   const selectors = [
     '[data-message-author-role="user"]',
-    '[data-message-author-role="assistant"]'
+    '[data-message-author-role="assistant"]',
+    '[data-testid*="user-message"]',
+    '[data-testid*="assistant-message"]',
+    '[data-testid*="message"]',
+    '[data-testid*="chat-turn"]',
+    'article',
+    'div[class*="message"]'
   ];
-  const candidates = [];
+
   for (const selector of selectors) {
     document.querySelectorAll(selector).forEach(el => {
-      const role = el.getAttribute('data-message-author-role');
-      if (role && (role === 'user' || role === 'assistant')) {
-        candidates.push({ el, role });
-      }
+      if (!isElementVisible(el)) return;
+      const container = el.closest(
+        '[data-message-author-role],[data-testid*="message"],[data-testid*="chat-turn"],article,div[class*="message"]'
+      ) || el;
+      const role = inferMessageRole(container) || inferMessageRole(el);
+      candidates.push({ el: container, role });
     });
   }
-  if (candidates.length === 0) {
-    document.querySelectorAll('article').forEach(article => {
-      const userChild = article.querySelector('[data-message-author-role="user"]');
-      const assistantChild = article.querySelector('[data-message-author-role="assistant"]');
-      const role = userChild ? 'user' : (assistantChild ? 'assistant' : null);
-      if (role) {
-        const contentEl = userChild || assistantChild;
-        candidates.push({ el: contentEl.closest('article') || contentEl, role });
-      }
-    });
-  }
+
   candidates.sort((a, b) => {
     const pos = a.el.compareDocumentPosition(b.el);
     return (pos & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1;
   });
+
+  let lastResolvedRole = null;
   for (const { el, role } of candidates) {
     if (seen.has(el)) continue;
     seen.add(el);
@@ -1418,7 +1441,15 @@ function extractFullConversation() {
       if (btnText) text = text.replace(btnText, '').trim();
     });
     text = text.replace(/Copy code|Regenerate|Thumbs up|Thumbs down/gi, '').trim();
-    if (text) messages.push({ role, content: text });
+    if (!text) continue;
+
+    // Fallback for UIs where role is not explicit (common in Claude DOM updates).
+    let resolvedRole = role;
+    if (!resolvedRole) {
+      resolvedRole = lastResolvedRole === 'user' ? 'assistant' : 'user';
+    }
+    lastResolvedRole = resolvedRole;
+    messages.push({ role: resolvedRole, content: text });
   }
   return messages;
 }
