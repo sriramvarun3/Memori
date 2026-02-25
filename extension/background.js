@@ -696,10 +696,22 @@ async function granolaGetMeetings(dateFrom, dateTo) {
           const parsed = parseGranolaMeetingsXml(getText);
           const found = parsed.find(p => p.id === id) || parsed[0];
           notes = found?.notes || found?.content || getText || '';
-          // Prefer richer data from get_meetings over list_meetings fallback
-          richTitle = found?.title && found.title !== 'Meeting' && found.title !== 'Untitled Meeting' ? found.title : '';
-          richDate = found?.date || '';
+
+          // Prefer richer title/date from XML parse
+          const xmlTitle = found?.title;
+          const xmlDate = found?.date;
           richAttendees = found?.attendees?.length ? found.attendees : [];
+
+          const isBad = t => !t || t === 'Meeting' || t === 'Untitled Meeting';
+          if (!isBad(xmlTitle)) {
+            richTitle = xmlTitle;
+            richDate = xmlDate || '';
+          } else {
+            // XML parse didn't yield a title — extract from raw text
+            const extracted = extractTitleDateFromText(notes);
+            richTitle = isBad(extracted.title) ? '' : extracted.title;
+            richDate = extracted.date || xmlDate || '';
+          }
         }
         meetingsWithNotes.push({
           ...m,
@@ -745,6 +757,40 @@ async function granolaGetMeetingDetails(meetingId) {
   } catch (error) {
     return { error: error.message };
   }
+}
+
+// Extract meeting title and date from raw meeting text when XML parsing misses them
+function extractTitleDateFromText(text) {
+  if (!text) return { title: '', date: '' };
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+
+  let title = '';
+  let date = '';
+
+  for (const line of lines) {
+    // Markdown headings: # Title or ## Title
+    const headingMatch = line.match(/^#{1,3}\s+(.+)/);
+    if (headingMatch && !title) {
+      title = headingMatch[1].trim();
+      continue;
+    }
+    // Key-value patterns: Title: X, Meeting: X, Name: X
+    const kvTitle = line.match(/^(?:title|meeting|name|subject)\s*:\s*(.+)/i);
+    if (kvTitle && !title) { title = kvTitle[1].trim(); continue; }
+    // Date patterns: Date: X, Time: X, When: X, or ISO-like strings
+    const kvDate = line.match(/^(?:date|time|when|scheduled|start)\s*:\s*(.+)/i);
+    if (kvDate && !date) { date = kvDate[1].trim(); continue; }
+    // ISO date in the line
+    const isoDate = line.match(/\b(\d{4}-\d{2}-\d{2}(?:T[\d:Z.+-]+)?)\b/);
+    if (isoDate && !date) { date = isoDate[1]; }
+  }
+
+  // Last resort: first non-empty, non-symbol line as title
+  if (!title && lines.length > 0) {
+    const candidate = lines.find(l => l.length > 3 && !/^[-=#*]+$/.test(l));
+    title = candidate || '';
+  }
+  return { title, date };
 }
 
 function extractMcpToolText(toolResult) {

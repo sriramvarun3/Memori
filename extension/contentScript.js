@@ -332,9 +332,9 @@ function triggerChatGPTSend(input) {
 
 function openSidebarToGranolaTab() {
   if (!sidebarContainer) return;
-  const sidebar = sidebarContainer.querySelector('#memori-sidebar');
-  if (sidebar && !sidebar.classList.contains('memori-sidebar-visible')) {
-    sidebar.classList.add('memori-sidebar-visible');
+  // sidebarContainer IS #memori-sidebar — operate on it directly
+  if (!sidebarContainer.classList.contains('memori-sidebar-visible')) {
+    sidebarContainer.classList.add('memori-sidebar-visible');
     sidebarVisible = true;
   }
   const tabBtns = sidebarContainer.querySelectorAll('.memori-tab-btn');
