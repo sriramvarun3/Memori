@@ -811,22 +811,52 @@ async function granolaChatWithGranola(userQuery) {
   }
 }
 
+function cleanGranolaContext(raw) {
+  // Collect unique meeting URLs from inline citations like [[15]](https://notes.granola.ai/...)
+  const citationPattern = /\s*\[\[\d+\]\]\((https?:\/\/[^)]+)\)/g;
+  const seenUrls = new Set();
+  const urls = [];
+  let match;
+  while ((match = citationPattern.exec(raw)) !== null) {
+    if (!seenUrls.has(match[1])) {
+      seenUrls.add(match[1]);
+      urls.push(match[1]);
+    }
+  }
+
+  // Strip all inline citations from the body text
+  const cleanedText = raw.replace(/\s*\[\[\d+\]\]\(https?:\/\/[^)]+\)/g, '').trim();
+
+  // Prepend deduplicated meeting links once at the top
+  if (urls.length === 0) return cleanedText;
+  const linksLine = 'Source meeting(s): ' + urls.join(' | ');
+  return linksLine + '\n\n' + cleanedText;
+}
+
 function composeGranolaGroundedPrompt(userQuery, granolaContext) {
-  return [
-    'You are answering the user by grounding in the provided Granola context.',
-    '',
-    '## User Original Query',
-    userQuery,
-    '',
-    '## Granola Context',
-    granolaContext,
-    '',
-    '## Instructions',
-    '- Answer the user query directly.',
-    '- Ground your response in the Granola Context above.',
-    '- If the context is insufficient or uncertain, say so explicitly.',
-    '- Do not fabricate details not supported by the context.'
-  ].join('\n');
+  const sections = [
+    'I have a question for you. I\'m also sharing relevant context from my Granola meeting notes to help ground your answer.',
+
+    '## My Question\n\n' + userQuery,
+
+    '## Context from My Granola Meeting Notes\n\n' + cleanGranolaContext(granolaContext),
+
+    [
+      '## How I\'d Like You to Respond',
+      '',
+      'Please answer using both your own knowledge and the meeting context above:',
+      '',
+      '- Weave the meeting context in naturally. For example: "Based on your conversation with [person] in [meeting], it sounds like..." or "Given what was agreed with [team], I\'d suggest...". Don\'t just quote notes mechanically.',
+      '',
+      '- Layer your own analysis on top of the context. The notes ground you in what\'s actually been discussed; your reasoning makes the answer useful.',
+      '',
+      '- If the context doesn\'t fully cover my question, say so honestly.',
+      '',
+      '- Format your response clearly with headings or bullet points where it helps.'
+    ].join('\n')
+  ];
+
+  return sections.join('\n\n\n');
 }
 
 // Get cached Granola meetings (no API call)

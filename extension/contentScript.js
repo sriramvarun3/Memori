@@ -295,7 +295,10 @@ function setChatGPTInputText(input, text) {
 
   if (input.contentEditable === 'true' || input.isContentEditable) {
     input.focus();
-    input.innerText = text;
+    // Select all existing content then replace via execCommand so that
+    // ProseMirror/Quill editors honour newlines and paragraph breaks.
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, text);
     input.dispatchEvent(new Event('input', { bubbles: true }));
     return true;
   }
