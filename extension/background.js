@@ -1019,6 +1019,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.action === 'composeGroundedPromptFromMeetings') {
+    const { userQuery, meetingsContext } = request;
+    const composedPrompt = composeGranolaGroundedPrompt(userQuery || '', meetingsContext || '');
+    sendResponse({ success: true, composedPrompt });
+    return true;
+  }
+
   if (request.action === 'getOpenAIApiKey') {
     chrome.storage.local.get([OPENAI_API_KEY_KEY]).then(r => sendResponse({ key: r[OPENAI_API_KEY_KEY] || '' }));
     return true;

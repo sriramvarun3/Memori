@@ -9,6 +9,8 @@ let saveButton = null;
 let autoCaptureEnabled = false;
 let mSendButton = null;
 let mSendInProgress = false;
+let mSendPendingQuery = null;   // user query waiting for meeting selection
+let mSendPendingMeetings = [];  // fetched meetings currently shown in sidebar
 
 // ChatGPT input selectors (may need updates if ChatGPT changes their DOM)
 const INPUT_SELECTORS = [
@@ -328,57 +330,75 @@ function triggerChatGPTSend(input) {
   return false;
 }
 
+function openSidebarToGranolaTab() {
+  if (!sidebarContainer) return;
+  const sidebar = sidebarContainer.querySelector('#memori-sidebar');
+  if (sidebar && !sidebar.classList.contains('memori-sidebar-visible')) {
+    sidebar.classList.add('memori-sidebar-visible');
+    sidebarVisible = true;
+  }
+  const tabBtns = sidebarContainer.querySelectorAll('.memori-tab-btn');
+  tabBtns.forEach(b => b.classList.remove('active'));
+  sidebarContainer.querySelector('[data-tab="granola"]')?.classList.add('active');
+  const memoriesPanel = sidebarContainer.querySelector('#memori-memories-panel');
+  const contextsPanel = sidebarContainer.querySelector('#memori-contexts-panel');
+  const granolaPanel  = sidebarContainer.querySelector('#memori-granola-list');
+  if (memoriesPanel) memoriesPanel.style.display = 'none';
+  if (contextsPanel) contextsPanel.style.display = 'none';
+  if (granolaPanel)  granolaPanel.style.display = '';
+}
+
 async function handleGranolaGroundedMSend() {
   if (mSendInProgress) return;
 
   const input = findChatGPTInput();
-  if (!input) {
-    alert('Could not find ChatGPT input');
-    return;
-  }
+  if (!input) { alert('Could not find chat input'); return; }
 
   const userQuery = extractTextFromInput(input);
-  if (!userQuery) {
-    alert('Type a message first');
-    return;
-  }
+  if (!userQuery) { alert('Type a message first'); return; }
 
   mSendInProgress = true;
-  if (mSendButton) {
-    mSendButton.disabled = true;
-    mSendButton.textContent = 'M...';
-  }
+  if (mSendButton) { mSendButton.disabled = true; mSendButton.textContent = 'M...'; }
 
   try {
-    const result = await chrome.runtime.sendMessage({
-      action: 'granolaGroundedComposePrompt',
-      userQuery
-    });
+    // Ensure authenticated
+    const authResult = await chrome.runtime.sendMessage({ action: 'granolaCheckAuth' });
+    if (!authResult.authenticated) {
+      const auth = await chrome.runtime.sendMessage({ action: 'granolaAuthenticate' });
+      if (!auth.success) {
+        alert(auth.error || 'Granola authentication failed');
+        return;
+      }
+    }
 
-    if (!result?.success || !result.composedPrompt) {
-      alert(result?.error || 'Could not prepare grounded prompt');
+    // Open sidebar on Granola tab and show loading
+    openSidebarToGranolaTab();
+    showGranolaQueryState('Fetching your meetings\u2026');
+
+    // Fetch fresh meetings (updates cache too)
+    const { meetings, error } = await chrome.runtime.sendMessage({ action: 'granolaFetchAndCacheMeetings' });
+
+    if (error) {
+      showGranolaQueryState(null, error);
       return;
     }
 
-    const didSet = setChatGPTInputText(input, result.composedPrompt);
-    if (!didSet) {
-      alert('Could not write grounded prompt into ChatGPT input');
+    if (!meetings || meetings.length === 0) {
+      showGranolaQueryState(null, 'No meetings found in Granola.');
       return;
     }
 
-    // Give ChatGPT editor a tick to reconcile the input update.
-    setTimeout(() => {
-      triggerChatGPTSend(input);
-    }, 50);
-  } catch (error) {
-    console.error('[Memori] M-send failed:', error);
-    alert(error.message || 'M-send failed');
+    // Store state and render checklist
+    mSendPendingQuery = userQuery;
+    mSendPendingMeetings = meetings;
+    renderGranolaMeetingsWithCheckboxes(userQuery, meetings);
+
+  } catch (err) {
+    console.error('[Memori] M-send failed:', err);
+    showGranolaQueryState(null, err.message || 'Failed to fetch meetings');
   } finally {
     mSendInProgress = false;
-    if (mSendButton) {
-      mSendButton.disabled = false;
-      mSendButton.textContent = 'M';
-    }
+    if (mSendButton) { mSendButton.disabled = false; mSendButton.textContent = 'M'; }
   }
 }
 
@@ -855,6 +875,12 @@ function createSidebar() {
       #memori-memories-panel {
         padding: 12px;
       }
+      #memori-granola-list {
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
       .memori-context-item {
         background: #ffffff;
         border: 1px solid #e5e7eb;
@@ -899,69 +925,38 @@ function createSidebar() {
       .memori-context-expand-btn:hover {
         background: #d1d5db;
       }
-      .memori-granola-refresh-bar {
-        padding: 8px 12px;
-        border-bottom: 1px solid #e5e7eb;
-      }
-      .memori-granola-refresh-btn {
-        width: 100%;
-        padding: 8px 12px;
-        border: 1px solid #10a37f;
-        border-radius: 6px;
-        background: #ffffff;
-        color: #10a37f;
-        font-size: 13px;
-        font-weight: 500;
-        cursor: pointer;
-        font-family: inherit;
-      }
-      .memori-granola-refresh-btn:hover {
-        background: #ecfdf5;
-      }
-      .memori-granola-refresh-btn:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
-      }
-      .memori-granola-item {
-        background: #ffffff;
-        border: 1px solid #e5e7eb;
-        border-radius: 8px;
-        padding: 12px;
-        margin-bottom: 12px;
-        transition: box-shadow 0.2s;
-      }
-      .memori-granola-item:hover {
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-      }
-      .memori-granola-title {
-        font-weight: 600;
-        color: #111827;
-        font-size: 14px;
-        margin-bottom: 6px;
-      }
-      .memori-granola-meta {
-        font-size: 12px;
+      /* ── Granola idle state ── */
+      .memori-granola-idle {
+        padding: 40px 24px;
+        text-align: center;
         color: #6b7280;
-        margin-bottom: 8px;
       }
-      .memori-granola-actions {
-        display: flex;
-        gap: 8px;
-      }
-      .memori-granola-inject-btn {
-        padding: 6px 12px;
-        border: none;
-        border-radius: 6px;
-        font-size: 12px;
-        cursor: pointer;
-        font-weight: 500;
+      .memori-granola-idle-icon {
+        width: 44px;
+        height: 44px;
+        border-radius: 10px;
         background: #10a37f;
         color: white;
-        font-family: inherit;
+        font-weight: 800;
+        font-size: 18px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 0 auto 16px;
       }
-      .memori-granola-inject-btn:hover {
-        background: #0d8c6d;
+      .memori-granola-idle-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: #111827;
+        margin-bottom: 8px;
       }
+      .memori-granola-idle-hint {
+        font-size: 12px;
+        line-height: 1.6;
+        color: #6b7280;
+      }
+
+      /* ── Connect button ── */
       .memori-granola-connect-btn {
         padding: 10px 20px;
         border: none;
@@ -974,41 +969,113 @@ function createSidebar() {
         font-family: inherit;
         width: 100%;
       }
-      .memori-granola-connect-btn:hover {
-        background: #0d8c6d;
-      }
+      .memori-granola-connect-btn:hover { background: #0d8c6d; }
+      .memori-granola-connect-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+      /* ── Loading ── */
       .memori-granola-loading {
         padding: 40px 20px;
         text-align: center;
         color: #6b7280;
         font-size: 14px;
       }
-      .memori-granola-notes {
-        font-size: 13px;
-        color: #374151;
-        line-height: 1.5;
-        margin-top: 8px;
-        white-space: pre-wrap;
-        word-wrap: break-word;
-        max-height: 120px;
-        overflow: hidden;
-        transition: max-height 0.3s ease;
+
+      /* ── Selection header ── */
+      .memori-granola-selection-header {
+        padding: 12px 16px;
+        border-bottom: 1px solid #e5e7eb;
+        background: #f9fafb;
       }
-      .memori-granola-notes.expanded {
-        max-height: none;
-      }
-      .memori-granola-see-more {
-        background: none;
-        border: none;
-        color: #10a37f;
+      .memori-granola-selection-hint {
         font-size: 12px;
+        color: #6b7280;
+        margin: 0 0 6px;
+      }
+      .memori-granola-query-preview {
+        font-size: 12px;
+        font-style: italic;
+        color: #374151;
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 6px;
+        padding: 6px 10px;
+        word-break: break-word;
+      }
+
+      /* ── Checklist ── */
+      #memori-granola-checklist {
+        padding: 8px 12px;
+        overflow-y: auto;
+        flex: 1;
+      }
+      .memori-granola-checkbox-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        padding: 10px 8px;
+        border-radius: 8px;
         cursor: pointer;
-        padding: 4px 0;
+        transition: background 0.15s;
+      }
+      .memori-granola-checkbox-item:hover { background: #f3f4f6; }
+      .memori-granola-checkbox {
+        margin-top: 3px;
+        width: 15px;
+        height: 15px;
+        accent-color: #10a37f;
+        flex-shrink: 0;
+        cursor: pointer;
+      }
+      .memori-granola-checkbox-info { flex: 1; min-width: 0; }
+      .memori-granola-title {
+        font-weight: 600;
+        color: #111827;
+        font-size: 13px;
+        margin-bottom: 3px;
+      }
+      .memori-granola-meta {
+        font-size: 11px;
+        color: #6b7280;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      /* ── Apply / Cancel actions ── */
+      .memori-granola-selection-actions {
+        display: flex;
+        gap: 8px;
+        padding: 10px 12px;
+        border-top: 1px solid #e5e7eb;
+        background: #f9fafb;
+      }
+      .memori-granola-apply-btn {
+        flex: 1;
+        padding: 9px 0;
+        border: none;
+        border-radius: 7px;
+        background: #10a37f;
+        color: white;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
         font-family: inherit;
       }
-      .memori-granola-see-more:hover {
-        text-decoration: underline;
+      .memori-granola-apply-btn:hover { background: #0d8c6d; }
+      .memori-granola-apply-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+      .memori-granola-cancel-btn {
+        padding: 9px 16px;
+        border: 1px solid #d1d5db;
+        border-radius: 7px;
+        background: #ffffff;
+        color: #374151;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        font-family: inherit;
       }
+      .memori-granola-cancel-btn:hover { background: #f9fafb; }
+      .memori-granola-cancel-btn:disabled { opacity: 0.6; cursor: not-allowed; }
     `;
     document.head.appendChild(style);
   }
@@ -1121,6 +1188,150 @@ function createSidebar() {
 }
 
 // Render Granola meetings into container (shared helper)
+// Show a transient loading/error message in the Granola panel (during M-send flow)
+function showGranolaQueryState(loadingMsg, errorMsg) {
+  if (!sidebarContainer) return;
+  const panel = sidebarContainer.querySelector('#memori-granola-list');
+  if (!panel) return;
+  if (loadingMsg) {
+    panel.innerHTML = `<div class="memori-granola-loading">${escapeHtml(loadingMsg)}</div>`;
+  } else if (errorMsg) {
+    panel.innerHTML = `
+      <div class="memori-granola-idle">
+        <p style="color:#dc2626;">${escapeHtml(errorMsg)}</p>
+        <p style="margin-top:8px;font-size:12px;color:#6b7280;">Type a message in the chat and press <strong>M</strong> to try again.</p>
+      </div>`;
+  }
+}
+
+// Render the checklist of meetings for user to select before sending
+function renderGranolaMeetingsWithCheckboxes(userQuery, meetings) {
+  if (!sidebarContainer) return;
+  const panel = sidebarContainer.querySelector('#memori-granola-list');
+  if (!panel) return;
+
+  const itemsHtml = meetings.map((meeting, idx) => {
+    const id = meeting.id || meeting.meeting_id || String(idx);
+    const title = meeting.title || meeting.name || meeting.subject || 'Untitled Meeting';
+    const date = meeting.date || meeting.meeting_date || meeting.created_at || meeting.start_time || '';
+    const attendees = meeting.attendees || meeting.participants || [];
+    const attendeesStr = Array.isArray(attendees) ? attendees.join(', ') : (attendees || '');
+    const dateStr = date ? (typeof date === 'string' ? formatGranolaDate(date) : formatGranolaDate(new Date(date).toISOString())) : '';
+    return `
+      <label class="memori-granola-checkbox-item" data-meeting-index="${idx}">
+        <input type="checkbox" class="memori-granola-checkbox" data-meeting-index="${idx}" checked>
+        <div class="memori-granola-checkbox-info">
+          <div class="memori-granola-title">${escapeHtml(title)}</div>
+          ${dateStr || attendeesStr ? `
+            <div class="memori-granola-meta">
+              ${dateStr ? `<span>${dateStr}</span>` : ''}
+              ${attendeesStr ? `<span>${escapeHtml(attendeesStr)}</span>` : ''}
+            </div>` : ''}
+        </div>
+      </label>`;
+  }).join('');
+
+  panel.innerHTML = `
+    <div class="memori-granola-selection-header">
+      <p class="memori-granola-selection-hint">Select the meetings to include as context for your query:</p>
+      <div class="memori-granola-query-preview">${escapeHtml(userQuery.length > 120 ? userQuery.substring(0, 120) + '\u2026' : userQuery)}</div>
+    </div>
+    <div id="memori-granola-checklist">${itemsHtml}</div>
+    <div class="memori-granola-selection-actions">
+      <button id="memori-granola-apply-btn" class="memori-granola-apply-btn">Apply &amp; Send</button>
+      <button id="memori-granola-cancel-btn" class="memori-granola-cancel-btn">Cancel</button>
+    </div>
+  `;
+
+  panel.querySelector('#memori-granola-apply-btn').addEventListener('click', () => {
+    applyGranolaSelection();
+  });
+  panel.querySelector('#memori-granola-cancel-btn').addEventListener('click', () => {
+    mSendPendingQuery = null;
+    mSendPendingMeetings = [];
+    showGranolaIdleState();
+  });
+}
+
+// Called when user clicks "Apply & Send"
+async function applyGranolaSelection() {
+  if (!sidebarContainer) return;
+  const panel = sidebarContainer.querySelector('#memori-granola-list');
+  const applyBtn = panel?.querySelector('#memori-granola-apply-btn');
+  const cancelBtn = panel?.querySelector('#memori-granola-cancel-btn');
+  if (applyBtn) { applyBtn.disabled = true; applyBtn.textContent = 'Composing\u2026'; }
+  if (cancelBtn) cancelBtn.disabled = true;
+
+  try {
+    const checkedBoxes = panel?.querySelectorAll('.memori-granola-checkbox:checked') || [];
+    if (checkedBoxes.length === 0) {
+      alert('Please select at least one meeting.');
+      if (applyBtn) { applyBtn.disabled = false; applyBtn.textContent = 'Apply & Send'; }
+      if (cancelBtn) cancelBtn.disabled = false;
+      return;
+    }
+
+    // Build combined context from selected meetings
+    const selectedMeetings = Array.from(checkedBoxes).map(cb => {
+      const idx = parseInt(cb.getAttribute('data-meeting-index'), 10);
+      return mSendPendingMeetings[idx];
+    }).filter(Boolean);
+
+    const meetingsContext = selectedMeetings.map(m => {
+      const title = m.title || m.name || m.subject || 'Untitled Meeting';
+      const date = m.date || m.meeting_date || m.created_at || m.start_time || '';
+      const attendees = m.attendees || m.participants || [];
+      const attendeesStr = Array.isArray(attendees) ? attendees.join(', ') : (attendees || '');
+      const notes = m.notes || m.content || m.raw || m.summary_text || m.summary_markdown || '';
+      const header = [
+        `### ${title}`,
+        date ? `Date: ${date}` : '',
+        attendeesStr ? `Attendees: ${attendeesStr}` : ''
+      ].filter(Boolean).join('\n');
+      return header + (notes ? '\n\n' + notes : '');
+    }).join('\n\n---\n\n');
+
+    const userQuery = mSendPendingQuery;
+
+    // Ask background to compose the grounded prompt
+    const result = await chrome.runtime.sendMessage({
+      action: 'composeGroundedPromptFromMeetings',
+      userQuery,
+      meetingsContext
+    });
+
+    if (!result?.success || !result.composedPrompt) {
+      alert('Failed to compose prompt');
+      if (applyBtn) { applyBtn.disabled = false; applyBtn.textContent = 'Apply & Send'; }
+      if (cancelBtn) cancelBtn.disabled = false;
+      return;
+    }
+
+    // Inject into chat input and send
+    const input = findChatGPTInput();
+    if (!input) {
+      alert('Could not find the chat input. Make sure you are on the chat page.');
+      if (applyBtn) { applyBtn.disabled = false; applyBtn.textContent = 'Apply & Send'; }
+      if (cancelBtn) cancelBtn.disabled = false;
+      return;
+    }
+
+    setChatGPTInputText(input, result.composedPrompt);
+    setTimeout(() => triggerChatGPTSend(input), 50);
+
+    // Reset state and show idle
+    mSendPendingQuery = null;
+    mSendPendingMeetings = [];
+    showGranolaIdleState();
+
+  } catch (err) {
+    console.error('[Memori] applyGranolaSelection failed:', err);
+    alert(err.message || 'Failed to send');
+    if (applyBtn) { applyBtn.disabled = false; applyBtn.textContent = 'Apply & Send'; }
+    if (cancelBtn) cancelBtn.disabled = false;
+  }
+}
+
 function renderGranolaMeetingsList(meetings, container) {
   const COLLAPSE_LENGTH = 200;
   container.innerHTML = meetings.map((meeting, idx) => {
@@ -1202,175 +1413,59 @@ function renderGranolaMeetingsList(meetings, container) {
   });
 }
 
-// Load Granola recordings: use cache first, auto-fetch if empty
+// Show the idle state for the Granola panel (default when tab is opened)
 async function loadGranolaRecordings() {
   if (!sidebarContainer) return;
-  const listContainer = sidebarContainer.querySelector('#memori-granola-list');
-  if (!listContainer) return;
+  const panel = sidebarContainer.querySelector('#memori-granola-list');
+  if (!panel) return;
+
+  // If an M-send is in progress or we already have a pending query with results, don't overwrite
+  if (mSendPendingQuery && mSendPendingMeetings.length > 0) return;
 
   try {
     const authResult = await chrome.runtime.sendMessage({ action: 'granolaCheckAuth' });
-
     if (!authResult.authenticated) {
-      listContainer.innerHTML = `
-        <div class="memori-empty">
-          <p style="margin-bottom: 16px;">Connect your Granola account to view meeting recordings.</p>
+      panel.innerHTML = `
+        <div class="memori-granola-idle">
+          <p style="margin-bottom: 16px;">Connect your Granola account to use meeting context.</p>
           <button class="memori-granola-connect-btn" id="memori-granola-connect">Connect to Granola</button>
         </div>
       `;
-      const connectBtn = listContainer.querySelector('#memori-granola-connect');
-      if (connectBtn) {
-        connectBtn.addEventListener('click', async () => {
-          connectBtn.disabled = true;
-          connectBtn.textContent = 'Connecting...';
-          const result = await chrome.runtime.sendMessage({ action: 'granolaAuthenticate' });
-          connectBtn.disabled = false;
-          connectBtn.textContent = 'Connect to Granola';
-          if (result.success) {
-            loadGranolaRecordings();
-          } else {
-            listContainer.innerHTML = `
-              <div class="memori-error">
-                <p>${escapeHtml(result.error || 'Authentication failed')}</p>
-                <button class="memori-granola-connect-btn" id="memori-granola-retry" style="margin-top: 12px;">Retry</button>
-              </div>
-            `;
-            listContainer.querySelector('#memori-granola-retry')?.addEventListener('click', () => loadGranolaRecordings());
-          }
-        });
-      }
-      return;
-    }
-
-    // Try cache first (no API call)
-    const { meetings: cachedMeetings, cachedAt } = await chrome.runtime.sendMessage({ action: 'getGranolaMeetingsCached' });
-
-    if (cachedMeetings && cachedMeetings.length > 0) {
-      // Show cached data immediately with Refresh button
-      listContainer.innerHTML = `
-        <div class="memori-granola-refresh-bar">
-          <button id="memori-granola-refresh-btn" class="memori-granola-refresh-btn">Refresh</button>
-        </div>
-        <div id="memori-granola-items"></div>
-      `;
-      const itemsEl = listContainer.querySelector('#memori-granola-items');
-      renderGranolaMeetingsList(cachedMeetings, itemsEl);
-      listContainer.querySelector('#memori-granola-refresh-btn')?.addEventListener('click', () => refreshGranolaRecordings());
-      return;
-    }
-
-    // Cache empty: auto-fetch (same as old behavior)
-    listContainer.innerHTML = '<div class="memori-granola-loading">Loading...</div>';
-    const { meetings, error } = await chrome.runtime.sendMessage({ action: 'granolaFetchAndCacheMeetings' });
-
-    if (error) {
-      listContainer.innerHTML = `
-        <div class="memori-error">
-          <p>${escapeHtml(error)}</p>
-          <button class="memori-granola-connect-btn" id="memori-granola-reconnect" style="margin-top: 12px;">Reconnect</button>
-        </div>
-      `;
-      listContainer.querySelector('#memori-granola-reconnect')?.addEventListener('click', async () => {
+      panel.querySelector('#memori-granola-connect')?.addEventListener('click', async () => {
+        const btn = panel.querySelector('#memori-granola-connect');
+        btn.disabled = true;
+        btn.textContent = 'Connecting\u2026';
         const result = await chrome.runtime.sendMessage({ action: 'granolaAuthenticate' });
-        if (result.success) {
-          loadGranolaRecordings();
-        } else {
-          listContainer.querySelector('p').textContent = result.error || 'Reconnection failed';
+        btn.disabled = false;
+        btn.textContent = 'Connect to Granola';
+        if (result.success) loadGranolaRecordings();
+        else {
+          panel.innerHTML = `<div class="memori-error"><p>${escapeHtml(result.error || 'Authentication failed')}</p>
+            <button class="memori-granola-connect-btn" style="margin-top:12px;" id="memori-granola-retry">Retry</button></div>`;
+          panel.querySelector('#memori-granola-retry')?.addEventListener('click', () => loadGranolaRecordings());
         }
       });
       return;
     }
-
-    if (!meetings || meetings.length === 0) {
-      listContainer.innerHTML = `
-        <div class="memori-granola-refresh-bar">
-          <button id="memori-granola-refresh-btn" class="memori-granola-refresh-btn">Refresh</button>
-        </div>
-        <div class="memori-empty">No recordings found.</div>
-      `;
-      listContainer.querySelector('#memori-granola-refresh-btn')?.addEventListener('click', () => refreshGranolaRecordings());
-      return;
-    }
-    
-    // Success: render with Refresh button
-    listContainer.innerHTML = `
-      <div class="memori-granola-refresh-bar">
-        <button id="memori-granola-refresh-btn" class="memori-granola-refresh-btn">Refresh</button>
-      </div>
-      <div id="memori-granola-items"></div>
-    `;
-    const itemsEl = listContainer.querySelector('#memori-granola-items');
-    renderGranolaMeetingsList(meetings, itemsEl);
-    listContainer.querySelector('#memori-granola-refresh-btn')?.addEventListener('click', () => refreshGranolaRecordings());
-    
+    showGranolaIdleState();
   } catch (err) {
-    console.error('[Memori] Error loading Granola recordings:', err);
-    listContainer.innerHTML = '<div class="memori-error">Error loading recordings</div>';
+    console.error('[Memori] Error loading Granola panel:', err);
+    panel.innerHTML = '<div class="memori-error">Error loading Granola panel</div>';
   }
 }
 
-// Manual refresh: fetch from Granola API and update display
-async function refreshGranolaRecordings() {
+// Show the idle/ready state in the Granola panel
+function showGranolaIdleState() {
   if (!sidebarContainer) return;
-  const listContainer = sidebarContainer.querySelector('#memori-granola-list');
-  const refreshBtn = listContainer?.querySelector('#memori-granola-refresh-btn');
-  if (!listContainer) return;
-
-  if (refreshBtn) {
-    refreshBtn.disabled = true;
-    refreshBtn.textContent = 'Fetching...';
-  }
-  listContainer.innerHTML = '<div class="memori-granola-loading">Fetching from Granola...</div>';
-
-  try {
-    const authResult = await chrome.runtime.sendMessage({ action: 'granolaCheckAuth' });
-    if (!authResult.authenticated) {
-      listContainer.innerHTML = `
-        <div class="memori-empty">
-          <p style="margin-bottom: 16px;">Connect your Granola account first.</p>
-          <button class="memori-granola-connect-btn" id="memori-granola-connect">Connect to Granola</button>
-        </div>
-      `;
-      listContainer.querySelector('#memori-granola-connect')?.addEventListener('click', () => loadGranolaRecordings());
-      return;
-    }
-
-    const { meetings, error } = await chrome.runtime.sendMessage({ action: 'granolaFetchAndCacheMeetings' });
-
-    if (error) {
-      listContainer.innerHTML = `
-        <div class="memori-error">
-          <p>${escapeHtml(error)}</p>
-          <button class="memori-granola-connect-btn" id="memori-granola-reconnect" style="margin-top: 12px;">Reconnect</button>
-        </div>
-      `;
-      listContainer.querySelector('#memori-granola-reconnect')?.addEventListener('click', async () => {
-        const result = await chrome.runtime.sendMessage({ action: 'granolaAuthenticate' });
-        if (result.success) refreshGranolaRecordings();
-      });
-    } else if (!meetings || meetings.length === 0) {
-      listContainer.innerHTML = `
-        <div class="memori-granola-refresh-bar">
-          <button id="memori-granola-refresh-btn" class="memori-granola-refresh-btn">Refresh</button>
-        </div>
-        <div class="memori-empty">No recordings found.</div>
-      `;
-      listContainer.querySelector('#memori-granola-refresh-btn')?.addEventListener('click', () => refreshGranolaRecordings());
-    } else {
-      listContainer.innerHTML = `
-        <div class="memori-granola-refresh-bar">
-          <button id="memori-granola-refresh-btn" class="memori-granola-refresh-btn">Refresh</button>
-        </div>
-        <div id="memori-granola-items"></div>
-      `;
-      const itemsEl = listContainer.querySelector('#memori-granola-items');
-      renderGranolaMeetingsList(meetings, itemsEl);
-      listContainer.querySelector('#memori-granola-refresh-btn')?.addEventListener('click', () => refreshGranolaRecordings());
-    }
-  } catch (err) {
-    console.error('[Memori] Error refreshing Granola:', err);
-    listContainer.innerHTML = '<div class="memori-error">Error fetching recordings</div>';
-  }
+  const panel = sidebarContainer.querySelector('#memori-granola-list');
+  if (!panel) return;
+  panel.innerHTML = `
+    <div class="memori-granola-idle">
+      <div class="memori-granola-idle-icon">M</div>
+      <p class="memori-granola-idle-title">Ground your answers in Granola</p>
+      <p class="memori-granola-idle-hint">Type a message in the chat, then press the <strong>M</strong> button next to the send button. Memori will fetch your relevant meetings and let you pick which ones to include as context before sending.</p>
+    </div>
+  `;
 }
 
 function formatGranolaDate(dateStr) {
