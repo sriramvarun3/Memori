@@ -361,22 +361,15 @@ async function handleGranolaGroundedMSend() {
   if (mSendButton) { mSendButton.disabled = true; mSendButton.textContent = 'M...'; }
 
   try {
-    // Ensure authenticated
-    const authResult = await chrome.runtime.sendMessage({ action: 'granolaCheckAuth' });
-    if (!authResult.authenticated) {
-      const auth = await chrome.runtime.sendMessage({ action: 'granolaAuthenticate' });
-      if (!auth.success) {
-        alert(auth.error || 'Granola authentication failed');
-        return;
-      }
-    }
-
     // Open sidebar on Granola tab and show loading
     openSidebarToGranolaTab();
-    showGranolaQueryState('Fetching your meetings\u2026');
+    showGranolaQueryState('Finding relevant meetings\u2026');
 
-    // Fetch fresh meetings (updates cache too)
-    const { meetings, error } = await chrome.runtime.sendMessage({ action: 'granolaFetchAndCacheMeetings' });
+    // Fetch meetings and filter by relevance to the user query
+    const { meetings, error } = await chrome.runtime.sendMessage({
+      action: 'granolaFetchMeetingsForQuery',
+      userQuery
+    });
 
     if (error) {
       showGranolaQueryState(null, error);
@@ -384,7 +377,7 @@ async function handleGranolaGroundedMSend() {
     }
 
     if (!meetings || meetings.length === 0) {
-      showGranolaQueryState(null, 'No meetings found in Granola.');
+      showGranolaQueryState(null, 'No relevant meetings found in Granola for this query.');
       return;
     }
 

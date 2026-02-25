@@ -687,14 +687,28 @@ async function granolaGetMeetings(dateFrom, dateTo) {
           arguments: { meeting_ids: [id] }
         }, token);
         let notes = '';
+        let richTitle = '';
+        let richDate = '';
+        let richAttendees = [];
         if (getResult?.content) {
           const textContent = getResult.content.find(c => c.type === 'text');
           const getText = textContent ? textContent.text : '';
           const parsed = parseGranolaMeetingsXml(getText);
           const found = parsed.find(p => p.id === id) || parsed[0];
           notes = found?.notes || found?.content || getText || '';
+          // Prefer richer data from get_meetings over list_meetings fallback
+          richTitle = found?.title && found.title !== 'Meeting' && found.title !== 'Untitled Meeting' ? found.title : '';
+          richDate = found?.date || '';
+          richAttendees = found?.attendees?.length ? found.attendees : [];
         }
-        meetingsWithNotes.push({ ...m, notes, content: notes });
+        meetingsWithNotes.push({
+          ...m,
+          title: richTitle || m.title || 'Untitled Meeting',
+          date: richDate || m.date || '',
+          attendees: richAttendees.length ? richAttendees : (m.attendees || []),
+          notes,
+          content: notes
+        });
       } catch (e) {
         meetingsWithNotes.push({ ...m });
       }
@@ -859,6 +873,39 @@ function composeGranolaGroundedPrompt(userQuery, granolaContext) {
   return sections.join('\n\n\n');
 }
 
+// Fetch meetings AND run a relevance query in parallel, returning only relevant meetings.
+// Falls back to all meetings if relevance can't be determined.
+async function granolaFetchMeetingsForQuery(userQuery) {
+  const [fetchResult, chatResult] = await Promise.all([
+    granolaFetchAndCacheMeetings(),
+    granolaChatWithGranola(userQuery)
+  ]);
+
+  const allMeetings = fetchResult.meetings || [];
+
+  // Extract meeting IDs cited in Granola's response (URLs contain the meeting UUID)
+  const citedIds = new Set();
+  if (chatResult?.contextText) {
+    const urlPattern = /https:\/\/notes\.granola\.ai\/d\/([\w-]+)/g;
+    let m;
+    while ((m = urlPattern.exec(chatResult.contextText)) !== null) {
+      citedIds.add(m[1]);
+    }
+  }
+
+  // Filter to cited meetings; fall back to all if nothing matched
+  const relevantMeetings = citedIds.size > 0
+    ? allMeetings.filter(m => citedIds.has(m.id))
+    : allMeetings;
+
+  return {
+    meetings: relevantMeetings,
+    allMeetings,
+    error: fetchResult.error,
+    needsAuth: chatResult?.needsAuth || false
+  };
+}
+
 // Get cached Granola meetings (no API call)
 async function getGranolaMeetingsCached() {
   try {
@@ -1016,6 +1063,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'deleteContextHandoff') {
     deleteContextHandoff(request.contextId).then(sendResponse);
+    return true;
+  }
+
+  if (request.action === 'granolaFetchMeetingsForQuery') {
+    (async () => {
+      const result = await granolaFetchMeetingsForQuery(request.userQuery || '');
+      if (result.needsAuth) {
+        const auth = await granolaAuthenticate();
+        if (!auth.success) {
+          sendResponse({ error: auth.error || 'Granola authentication failed', meetings: [] });
+          return;
+        }
+        const retry = await granolaFetchMeetingsForQuery(request.userQuery || '');
+        sendResponse(retry);
+      } else {
+        sendResponse(result);
+      }
+    })();
     return true;
   }
 
