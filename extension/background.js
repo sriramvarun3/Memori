@@ -988,60 +988,70 @@ async function granolaFetchMeetingsForQuery(userQuery) {
     }
 
     // Keep only the relevant stubs (or all if relevance detection gave nothing)
-    const relevantStubs = relevantIds.size > 0
+    // Deduplicate by ID so we never show the same meeting twice
+    const seenIds = new Set();
+    const rawRelevant = relevantIds.size > 0
       ? allStubs.filter(s => relevantIds.has(s.id))
       : allStubs;
+    const relevantStubs = rawRelevant.filter(s => {
+      if (!s.id || seenIds.has(s.id)) return false;
+      seenIds.add(s.id);
+      return true;
+    });
     if (relevantStubs.length === 0) return { meetings: [] };
 
-    // 5. get_meetings — ONE batched call for all relevant IDs
+    // 5. get_meetings — one call PER relevant meeting (typically 2-5 calls).
+    // We do NOT batch because the combined response text makes it impossible
+    // to reliably attribute titles/dates/notes to individual meetings.
+    // list_meetings already gave us the correct unique title & date per stub,
+    // so we only need get_meetings for the notes content.
     const isBad = t => !t || t === 'Meeting' || t === 'Untitled Meeting';
-    const relevantIdsArr = relevantStubs.map(s => s.id).filter(Boolean);
-    let meetingsWithNotes = relevantStubs.map(s => ({ ...s }));
+    const meetingsWithNotes = [];
 
-    if (relevantIdsArr.length > 0) {
+    for (const stub of relevantStubs) {
+      if (!stub.id) {
+        meetingsWithNotes.push({ ...stub });
+        continue;
+      }
       try {
         const getResult = await mcpRequest('tools/call', {
           name: 'get_meetings',
-          arguments: { meeting_ids: relevantIdsArr }
+          arguments: { meeting_ids: [stub.id] }
         }, token);
         const rawText = getResult?.content?.find(c => c.type === 'text')?.text || '';
         const parsed = parseGranolaMeetingsXml(rawText);
+        const found = parsed.find(p => p.id === stub.id) || parsed[0];
+        const notes = found?.notes || found?.content || rawText;
 
-        meetingsWithNotes = relevantStubs.map(stub => {
-          const found = parsed.find(p => p.id === stub.id) ||
-                        (parsed.length === 1 && relevantIdsArr.length === 1 ? parsed[0] : null);
-          const notes = found?.notes || found?.content || (found ? '' : rawText);
+        // Title & date: trust list_meetings stub first; only override if
+        // get_meetings unambiguously gives something better for this single meeting.
+        let title = stub.title || '';
+        let date  = stub.date  || '';
+        let attendees = stub.attendees || [];
 
-          let richTitle = '';
-          let richDate = '';
-          let richAttendees = [];
-          if (found) {
-            if (!isBad(found.title)) {
-              richTitle = found.title;
-              richDate = found.date || '';
-            } else {
-              const ex = extractTitleDateFromText(notes);
-              richTitle = isBad(ex.title) ? '' : ex.title;
-              richDate = ex.date || '';
-            }
-            richAttendees = found.attendees?.length ? found.attendees : [];
-          } else {
-            const ex = extractTitleDateFromText(rawText);
-            richTitle = isBad(ex.title) ? '' : ex.title;
-            richDate = ex.date || '';
-          }
+        if (found) {
+          if (isBad(title) && !isBad(found.title)) title = found.title;
+          if (!date && found.date) date = found.date;
+          if (!attendees.length && found.attendees?.length) attendees = found.attendees;
+        }
+        // Last resort: extract from raw text only when stub had nothing
+        if (isBad(title) || !date) {
+          const ex = extractTitleDateFromText(rawText);
+          if (isBad(title) && !isBad(ex.title)) title = ex.title;
+          if (!date && ex.date) date = ex.date;
+        }
 
-          return {
-            ...stub,
-            title: richTitle || stub.title || 'Untitled Meeting',
-            date: richDate || stub.date || '',
-            attendees: richAttendees.length ? richAttendees : (stub.attendees || []),
-            notes,
-            content: notes
-          };
+        meetingsWithNotes.push({
+          ...stub,
+          title: title || 'Untitled Meeting',
+          date,
+          attendees,
+          notes,
+          content: notes
         });
       } catch (e) {
-        console.warn('[Memori] get_meetings batch failed, using stubs:', e);
+        console.warn('[Memori] get_meetings failed for', stub.id, e);
+        meetingsWithNotes.push({ ...stub });
       }
     }
 

@@ -1462,14 +1462,18 @@ function showGranolaIdleState() {
 }
 
 function formatGranolaDate(dateStr) {
+  if (!dateStr) return '';
   try {
     const date = new Date(dateStr);
+    if (isNaN(date.getTime())) return dateStr; // unparseable — show raw
     const now = new Date();
     const diff = now - date;
-    if (diff < 86400000) return 'Today';
-    if (diff < 172800000) return 'Yesterday';
-    if (diff < 604800000) return `${Math.floor(diff / 86400000)} days ago`;
-    return date.toLocaleDateString();
+    const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const dateLabel = date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+    if (diff < 86400000)   return `Today at ${timeStr}`;
+    if (diff < 172800000)  return `Yesterday at ${timeStr}`;
+    if (diff < 604800000)  return `${Math.floor(diff / 86400000)} days ago`;
+    return `${dateLabel}`;
   } catch (_) {
     return dateStr;
   }
