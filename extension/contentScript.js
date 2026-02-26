@@ -367,10 +367,17 @@ async function handleGranolaGroundedMSend() {
     showGranolaQueryState('Finding relevant meetings\u2026');
 
     // Fetch meetings and filter by relevance to the user query
-    const { meetings, error } = await chrome.runtime.sendMessage({
+    const fetchResponse = await chrome.runtime.sendMessage({
       action: 'granolaFetchMeetingsForQuery',
       userQuery
     });
+
+    if (!fetchResponse) {
+      showGranolaQueryState(null, 'No response from background. Try reloading the extension.');
+      return;
+    }
+
+    const { meetings, synthesizedContext, error } = fetchResponse;
 
     if (error) {
       showGranolaQueryState(null, error);
@@ -385,7 +392,7 @@ async function handleGranolaGroundedMSend() {
     // Store state and render checklist
     mSendPendingQuery = userQuery;
     mSendPendingMeetings = meetings;
-    mSendSynthesizedContext = result.synthesizedContext || '';
+    mSendSynthesizedContext = synthesizedContext || '';
     renderGranolaMeetingsWithCheckboxes(userQuery, meetings);
 
   } catch (err) {

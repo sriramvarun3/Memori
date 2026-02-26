@@ -551,81 +551,84 @@ async function granolaCheckAuth() {
   return { authenticated: !!token };
 }
 
-// Parse Granola XML/HTML-like response (e.g. <meetings_data><meeting id="..." title="...">...</meeting></meetings_data>)
+// Pure-regex XML parser for Granola meeting responses.
+// DOMParser is NOT available in service workers, so we parse manually.
 function parseGranolaMeetingsXml(text) {
   const meetings = [];
   if (!text || !text.trim()) return meetings;
-  try {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString('<root>' + text + '</root>', 'text/xml');
-    const meetingEls = doc.querySelectorAll('meeting');
-    for (const el of meetingEls) {
-      const id = el.getAttribute('id') || '';
-      const title = el.getAttribute('title') || el.querySelector('title')?.textContent?.trim() || 'Untitled Meeting';
-      const date = el.getAttribute('date') || el.getAttribute('meeting_date') || el.querySelector('date')?.textContent?.trim() || '';
-      const attendeesEl = el.querySelector('attendees');
-      let attendees = [];
-      if (attendeesEl) {
-        const items = attendeesEl.querySelectorAll('attendee');
-        attendees = Array.from(items).map(a => a.textContent?.trim()).filter(Boolean);
-      } else {
-        const attrs = el.getAttribute('attendees');
-        if (attrs) attendees = attrs.split(',').map(s => s.trim());
+
+  // Helper: extract value of a named attribute from a tag attribute string
+  function attr(attrStr, name) {
+    const m = attrStr.match(new RegExp(name + '="([^"]*)"', 'i'));
+    return m ? m[1].trim() : '';
+  }
+
+  // Helper: extract content of a named child tag from an XML body string
+  function childText(body, tag) {
+    const m = body.match(new RegExp('<' + tag + '[^>]*>([\\s\\S]*?)<\\/' + tag + '>', 'i'));
+    return m ? m[1].trim() : '';
+  }
+
+  // Strategy 1: <meeting ...>...</meeting> blocks with full bodies
+  const blockRe = /<meeting\s([^>]*)>([\s\S]*?)<\/meeting>/gi;
+  let m;
+  while ((m = blockRe.exec(text)) !== null) {
+    const attrStr = m[1];
+    const body    = m[2] || '';
+
+    const id    = attr(attrStr, 'id');
+    const title = attr(attrStr, 'title') ||
+                  childText(body, 'title') || '';
+    const date  = attr(attrStr, 'date') ||
+                  attr(attrStr, 'meeting_date') ||
+                  childText(body, 'date') || '';
+
+    const attendeesRaw = attr(attrStr, 'attendees');
+    let attendees = attendeesRaw ? attendeesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+    if (!attendees.length) {
+      // Try <attendee>...</attendee> children
+      const attRe = /<attendee[^>]*>([\s\S]*?)<\/attendee>/gi;
+      let am;
+      while ((am = attRe.exec(body)) !== null) {
+        const n = am[1].trim();
+        if (n) attendees.push(n);
       }
-      const notesEl = el.querySelector('notes') || el.querySelector('enhanced_notes') || el.querySelector('summary') || el.querySelector('summary_text');
-      const notes = notesEl ? notesEl.textContent?.trim() : '';
-      const privateNotesEl = el.querySelector('private_notes');
-      const privateNotes = privateNotesEl ? privateNotesEl.textContent?.trim() : '';
-      const innerText = (el.textContent || '').trim();
-      const content = (notes || privateNotes || innerText).trim();
+    }
+
+    const notes = childText(body, 'notes') ||
+                  childText(body, 'enhanced_notes') ||
+                  childText(body, 'summary') ||
+                  childText(body, 'summary_text') ||
+                  childText(body, 'private_notes') ||
+                  body.replace(/<[^>]+>/g, ' ').trim(); // strip remaining tags
+
+    meetings.push({ id, title, date, attendees, notes, content: notes });
+  }
+
+  // Strategy 2: self-closing or attribute-only <meeting .../> tags
+  if (meetings.length === 0) {
+    const selfRe = /<meeting\s([^>]*?)\/>/gi;
+    while ((m = selfRe.exec(text)) !== null) {
+      const attrStr = m[1];
       meetings.push({
-        id,
-        title,
-        date,
-        attendees,
-        notes: notes || privateNotes,
-        content: content
+        id: attr(attrStr, 'id'),
+        title: attr(attrStr, 'title') || '',
+        date: attr(attrStr, 'date') || attr(attrStr, 'meeting_date') || '',
+        attendees: [],
+        notes: '',
+        content: ''
       });
     }
-    if (meetings.length === 0) {
-      const meetingRegex = /<meeting\s+([^>]+)>([\s\S]*?)<\/meeting>/gi;
-      let m;
-      while ((m = meetingRegex.exec(text)) !== null) {
-        const attrs = m[1];
-        const body = (m[2] || '').trim();
-        const idMatch = attrs.match(/id="([^"]*)"/);
-        const titleMatch = attrs.match(/title="([^"]*)"/);
-        const dateMatch = attrs.match(/date="([^"]*)"/);
-        meetings.push({
-          id: idMatch ? idMatch[1] : '',
-          title: titleMatch ? titleMatch[1] : 'Meeting',
-          date: dateMatch ? dateMatch[1] : '',
-          attendees: [],
-          notes: body,
-          content: body
-        });
-      }
-    }
-    if (meetings.length === 0) {
-      const tagMatch = text.match(/<meeting[^>]*id="([^"]*)"[^>]*title="([^"]*)"[^>]*\/?>/g);
-      if (tagMatch) {
-        for (const tag of tagMatch) {
-          const idMatch = tag.match(/id="([^"]*)"/);
-          const titleMatch = tag.match(/title="([^"]*)"/);
-          meetings.push({
-            id: idMatch ? idMatch[1] : '',
-            title: titleMatch ? titleMatch[1] : 'Meeting',
-            date: '',
-            attendees: [],
-            notes: '',
-            content: ''
-          });
-        }
-      }
-    }
-  } catch (e) {
-    console.warn('[Memori] XML parse fallback:', e);
   }
+
+  // Strategy 3: bare id="..." pairs anywhere in the text (last resort)
+  if (meetings.length === 0) {
+    const idRe = /\bid="([^"]+)"/g;
+    while ((m = idRe.exec(text)) !== null) {
+      meetings.push({ id: m[1], title: '', date: '', attendees: [], notes: '', content: '' });
+    }
+  }
+
   return meetings;
 }
 
