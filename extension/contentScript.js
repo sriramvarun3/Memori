@@ -333,12 +333,18 @@ function triggerChatGPTSend(input) {
 }
 
 function openSidebarToGranolaTab() {
-  if (!sidebarContainer) return;
-  // sidebarContainer IS #memori-sidebar — operate on it directly
-  if (!sidebarContainer.classList.contains('memori-sidebar-visible')) {
-    sidebarContainer.classList.add('memori-sidebar-visible');
-    sidebarVisible = true;
+  // Create sidebar if it hasn't been opened via the icon yet
+  if (!sidebarContainer) {
+    createSidebar();
   }
+  if (!sidebarContainer) return; // createSidebar failed for some reason
+
+  // Show the sidebar (mirrors toggleSidebar's open path)
+  sidebarContainer.classList.add('memori-sidebar-visible');
+  sidebarContainer.style.right = '0px';
+  sidebarVisible = true;
+
+  // Switch to Granola tab
   const tabBtns = sidebarContainer.querySelectorAll('.memori-tab-btn');
   tabBtns.forEach(b => b.classList.remove('active'));
   sidebarContainer.querySelector('[data-tab="granola"]')?.classList.add('active');
