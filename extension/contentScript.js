@@ -1342,6 +1342,7 @@ async function applyGranolaSelection() {
     // Close the sidebar so the user can see ChatGPT's response
     if (sidebarContainer) {
       sidebarContainer.classList.remove('memori-sidebar-visible');
+      sidebarContainer.style.right = '-400px';
       sidebarVisible = false;
     }
 
