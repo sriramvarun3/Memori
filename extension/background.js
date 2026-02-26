@@ -919,37 +919,137 @@ function composeGranolaGroundedPrompt(userQuery, granolaContext) {
   return sections.join('\n\n\n');
 }
 
-// Fetch meetings AND run a relevance query in parallel, returning only relevant meetings.
-// Falls back to all meetings if relevance can't be determined.
+// Optimised M-send flow — exactly 5 MCP calls regardless of meeting count:
+//   1. initialize
+//   2. list_meetings         → lightweight stubs (id + title + date)
+//   3. tools/list            → find the chat tool name
+//   4. query_granola_meetings → identify relevant meeting IDs via citations
+//   5. get_meetings (batch)  → full notes for relevant IDs only
 async function granolaFetchMeetingsForQuery(userQuery) {
-  const [fetchResult, chatResult] = await Promise.all([
-    granolaFetchAndCacheMeetings(),
-    granolaChatWithGranola(userQuery)
-  ]);
+  const token = await getGranolaToken();
+  if (!token) return { meetings: [], error: 'Not authenticated', needsAuth: true };
 
-  const allMeetings = fetchResult.meetings || [];
+  try {
+    // 1. Initialize (once, shared across all steps)
+    const initResult = await mcpRequest('initialize', {
+      protocolVersion: '2025-03-26',
+      capabilities: {},
+      clientInfo: { name: 'Memori', version: '1.0.0' }
+    }, token);
+    if (initResult?.needsAuth) return { meetings: [], error: 'Session expired', needsAuth: true };
 
-  // Extract meeting IDs cited in Granola's response (URLs contain the meeting UUID)
-  const citedIds = new Set();
-  if (chatResult?.contextText) {
-    const urlPattern = /https:\/\/notes\.granola\.ai\/d\/([\w-]+)/g;
-    let m;
-    while ((m = urlPattern.exec(chatResult.contextText)) !== null) {
-      citedIds.add(m[1]);
+    // 2. list_meetings — IDs + titles only, no notes fetched yet
+    const now = new Date();
+    const ninetyDaysAgo = new Date(now);
+    ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+    let listResult = await mcpRequest('tools/call', {
+      name: 'list_meetings',
+      arguments: { date_from: ninetyDaysAgo.toISOString().split('T')[0], date_to: now.toISOString().split('T')[0] }
+    }, token);
+    const hasContent = listResult?.content?.some(c => c.type === 'text' && c.text?.trim());
+    if (!hasContent) {
+      listResult = await mcpRequest('tools/call', { name: 'list_meetings', arguments: {} }, token);
     }
+
+    const listText = listResult?.content?.find(c => c.type === 'text')?.text ||
+                     (typeof listResult === 'string' ? listResult : '');
+    let allStubs = parseGranolaMeetingsXml(listText);
+    if (allStubs.length === 0 && listText) {
+      // Fallback: extract bare IDs from attribute patterns
+      const idMatches = listText.match(/id="([^"]+)"/g) || [];
+      allStubs = idMatches.map(m => ({
+        id: m.replace(/id="|"/g, ''), title: '', date: '', attendees: [], notes: '', content: ''
+      }));
+    }
+    if (allStubs.length === 0) return { meetings: [] };
+
+    // 3. tools/list — find the chat tool
+    const toolsList = await mcpRequest('tools/list', {}, token);
+    const chatTool = selectGranolaChatTool(toolsList?.tools || []);
+
+    // 4. query_granola_meetings — ask Granola which meetings are relevant
+    const relevantIds = new Set();
+    if (chatTool?.name) {
+      const question = [
+        'Use my Granola meeting context to answer this user request.',
+        `User request: ${userQuery}`,
+        'If relevant context is missing, say that explicitly.'
+      ].join('\n');
+      const chatResult = await mcpRequest('tools/call', {
+        name: chatTool.name,
+        arguments: buildChatToolArgs(chatTool, question)
+      }, token);
+      const contextText = extractMcpToolText(chatResult);
+      const urlPattern = /https:\/\/notes\.granola\.ai\/d\/([\w-]+)/g;
+      let urlMatch;
+      while ((urlMatch = urlPattern.exec(contextText)) !== null) {
+        relevantIds.add(urlMatch[1]);
+      }
+    }
+
+    // Keep only the relevant stubs (or all if relevance detection gave nothing)
+    const relevantStubs = relevantIds.size > 0
+      ? allStubs.filter(s => relevantIds.has(s.id))
+      : allStubs;
+    if (relevantStubs.length === 0) return { meetings: [] };
+
+    // 5. get_meetings — ONE batched call for all relevant IDs
+    const isBad = t => !t || t === 'Meeting' || t === 'Untitled Meeting';
+    const relevantIdsArr = relevantStubs.map(s => s.id).filter(Boolean);
+    let meetingsWithNotes = relevantStubs.map(s => ({ ...s }));
+
+    if (relevantIdsArr.length > 0) {
+      try {
+        const getResult = await mcpRequest('tools/call', {
+          name: 'get_meetings',
+          arguments: { meeting_ids: relevantIdsArr }
+        }, token);
+        const rawText = getResult?.content?.find(c => c.type === 'text')?.text || '';
+        const parsed = parseGranolaMeetingsXml(rawText);
+
+        meetingsWithNotes = relevantStubs.map(stub => {
+          const found = parsed.find(p => p.id === stub.id) ||
+                        (parsed.length === 1 && relevantIdsArr.length === 1 ? parsed[0] : null);
+          const notes = found?.notes || found?.content || (found ? '' : rawText);
+
+          let richTitle = '';
+          let richDate = '';
+          let richAttendees = [];
+          if (found) {
+            if (!isBad(found.title)) {
+              richTitle = found.title;
+              richDate = found.date || '';
+            } else {
+              const ex = extractTitleDateFromText(notes);
+              richTitle = isBad(ex.title) ? '' : ex.title;
+              richDate = ex.date || '';
+            }
+            richAttendees = found.attendees?.length ? found.attendees : [];
+          } else {
+            const ex = extractTitleDateFromText(rawText);
+            richTitle = isBad(ex.title) ? '' : ex.title;
+            richDate = ex.date || '';
+          }
+
+          return {
+            ...stub,
+            title: richTitle || stub.title || 'Untitled Meeting',
+            date: richDate || stub.date || '',
+            attendees: richAttendees.length ? richAttendees : (stub.attendees || []),
+            notes,
+            content: notes
+          };
+        });
+      } catch (e) {
+        console.warn('[Memori] get_meetings batch failed, using stubs:', e);
+      }
+    }
+
+    return { meetings: meetingsWithNotes, needsAuth: false };
+  } catch (error) {
+    console.error('[Memori] granolaFetchMeetingsForQuery error:', error);
+    return { meetings: [], error: error.message };
   }
-
-  // Filter to cited meetings; fall back to all if nothing matched
-  const relevantMeetings = citedIds.size > 0
-    ? allMeetings.filter(m => citedIds.has(m.id))
-    : allMeetings;
-
-  return {
-    meetings: relevantMeetings,
-    allMeetings,
-    error: fetchResult.error,
-    needsAuth: chatResult?.needsAuth || false
-  };
 }
 
 // Get cached Granola meetings (no API call)
