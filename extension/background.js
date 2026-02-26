@@ -914,8 +914,9 @@ async function granolaChatWithGranola(userQuery) {
   }
 }
 
-function cleanGranolaContext(raw) {
-  // Collect unique meeting URLs from inline citations like [[15]](https://notes.granola.ai/...)
+// meetingNames: optional Map<url, name> used to show meeting names instead of raw URLs
+function cleanGranolaContext(raw, meetingNames) {
+  // Collect unique citation URLs from [[n]](url) patterns
   const citationPattern = /\s*\[\[\d+\]\]\((https?:\/\/[^)]+)\)/g;
   const seenUrls = new Set();
   const urls = [];
@@ -930,32 +931,40 @@ function cleanGranolaContext(raw) {
   // Strip all inline citations from the body text
   const cleanedText = raw.replace(/\s*\[\[\d+\]\]\(https?:\/\/[^)]+\)/g, '').trim();
 
-  // Prepend deduplicated meeting links once at the top
   if (urls.length === 0) return cleanedText;
-  const linksLine = 'Source meeting(s): ' + urls.join(' | ');
-  return linksLine + '\n\n' + cleanedText;
+
+  // Resolve each URL to a meeting name when possible
+  const names = urls.map(url => {
+    if (meetingNames && meetingNames.has(url)) return meetingNames.get(url);
+    // Fall back to extracting the UUID from the URL as a short identifier
+    const uuidMatch = url.match(/\/d\/([\w-]+)\/?$/);
+    return uuidMatch ? uuidMatch[1] : url;
+  });
+
+  const sourceLine = 'Source meeting(s): ' + names.join(' | ');
+  return sourceLine + '\n\n' + cleanedText;
 }
 
-function composeGranolaGroundedPrompt(userQuery, granolaContext) {
+function composeGranolaGroundedPrompt(userQuery, granolaContext, meetingNames) {
   const sections = [
     'I have a question for you. I\'m also sharing relevant context from my Granola meeting notes to help ground your answer.',
 
     '## My Question\n\n' + userQuery,
 
-    '## Context from My Granola Meeting Notes\n\n' + cleanGranolaContext(granolaContext),
+    '## Context from My Granola Meeting Notes\n\n' + cleanGranolaContext(granolaContext, meetingNames),
 
     [
       '## How I\'d Like You to Respond',
       '',
-      'Please answer using both your own knowledge and the meeting context above:',
+      'Be concise and direct. Skip preamble — get straight to the point.',
       '',
-      '- Weave the meeting context in naturally. For example: "Based on your conversation with [person] in [meeting], it sounds like..." or "Given what was agreed with [team], I\'d suggest...". Don\'t just quote notes mechanically.',
+      '- **Answer the question first.** Lead with the most useful, actionable insight.',
       '',
-      '- Layer your own analysis on top of the context. The notes ground you in what\'s actually been discussed; your reasoning makes the answer useful.',
+      '- **Reference the meeting context naturally** when it\'s relevant — e.g. "Based on your conversation with [person] in [meeting]..." — but don\'t quote notes at length.',
       '',
-      '- If the context doesn\'t fully cover my question, say so honestly.',
+      '- **Keep it short.** Use bullet points or a brief numbered list if there are multiple steps. Avoid long paragraphs.',
       '',
-      '- Format your response clearly with headings or bullet points where it helps.'
+      '- If the context doesn\'t cover the question, say so in one sentence and give your best general answer.'
     ].join('\n')
   ];
 
@@ -1053,9 +1062,20 @@ async function granolaFetchMeetingsForQuery(userQuery) {
       return true;
     });
 
+    // Build url→name map so the prompt shows meeting names instead of raw URLs.
+    // The citation URLs contain the meeting UUID; stubs have the same UUIDs as IDs.
+    const meetingNameMap = {};
+    for (const stub of relevantStubs) {
+      if (stub.id && stub.title) {
+        // Map both the full notes URL and the bare UUID
+        meetingNameMap[`https://notes.granola.ai/d/${stub.id}`] = stub.title;
+      }
+    }
+
     return {
       meetings: relevantStubs,      // stubs with title + date from list_meetings
       synthesizedContext,           // full Granola-synthesised context for the prompt
+      meetingNameMap,               // url → meeting title for clean source attribution
       needsAuth: false
     };
   } catch (error) {
@@ -1243,8 +1263,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'composeGroundedPromptFromMeetings') {
-    const { userQuery, meetingsContext } = request;
-    const composedPrompt = composeGranolaGroundedPrompt(userQuery || '', meetingsContext || '');
+    const { userQuery, meetingsContext, meetingNameMap } = request;
+    // Rebuild Map from plain object (can't send Map over chrome.runtime.sendMessage)
+    const namesMap = meetingNameMap
+      ? new Map(Object.entries(meetingNameMap))
+      : undefined;
+    const composedPrompt = composeGranolaGroundedPrompt(userQuery || '', meetingsContext || '', namesMap);
     sendResponse({ success: true, composedPrompt });
     return true;
   }

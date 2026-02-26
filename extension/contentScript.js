@@ -12,6 +12,7 @@ let mSendInProgress = false;
 let mSendPendingQuery = null;          // user query waiting for meeting selection
 let mSendPendingMeetings = [];         // fetched meeting stubs shown in sidebar
 let mSendSynthesizedContext = '';      // pre-fetched Granola context (avoids extra MCP calls)
+let mSendMeetingNameMap = {};          // url → meeting title for source attribution
 
 // ChatGPT input selectors (may need updates if ChatGPT changes their DOM)
 const INPUT_SELECTORS = [
@@ -393,6 +394,7 @@ async function handleGranolaGroundedMSend() {
     mSendPendingQuery = userQuery;
     mSendPendingMeetings = meetings;
     mSendSynthesizedContext = synthesizedContext || '';
+    mSendMeetingNameMap = fetchResponse.meetingNameMap || {};
     renderGranolaMeetingsWithCheckboxes(userQuery, meetings);
 
   } catch (err) {
@@ -1252,6 +1254,7 @@ function renderGranolaMeetingsWithCheckboxes(userQuery, meetings) {
     mSendPendingQuery = null;
     mSendPendingMeetings = [];
     mSendSynthesizedContext = '';
+    mSendMeetingNameMap = {};
     showGranolaIdleState();
   });
 }
@@ -1301,7 +1304,8 @@ async function applyGranolaSelection() {
     const result = await chrome.runtime.sendMessage({
       action: 'composeGroundedPromptFromMeetings',
       userQuery,
-      meetingsContext
+      meetingsContext,
+      meetingNameMap: mSendMeetingNameMap
     });
 
     if (!result?.success || !result.composedPrompt) {
@@ -1323,11 +1327,17 @@ async function applyGranolaSelection() {
     setChatGPTInputText(input, result.composedPrompt);
     setTimeout(() => triggerChatGPTSend(input), 50);
 
-    // Reset state and show idle
+    // Reset state, close sidebar, and return to idle
     mSendPendingQuery = null;
     mSendPendingMeetings = [];
     mSendSynthesizedContext = '';
+    mSendMeetingNameMap = {};
     showGranolaIdleState();
+    // Close the sidebar so the user can see ChatGPT's response
+    if (sidebarContainer) {
+      sidebarContainer.classList.remove('memori-sidebar-visible');
+      sidebarVisible = false;
+    }
 
   } catch (err) {
     console.error('[Memori] applyGranolaSelection failed:', err);
