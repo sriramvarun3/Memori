@@ -287,9 +287,20 @@ function parseWWWAuthenticate(header) {
   return match ? match[1] : null;
 }
 
+// Session-scoped MCP call counter for logging
+let _mcpCallCount = 0;
+
 // MCP request helper
 async function mcpRequest(method, params, token) {
+  const callNum = ++_mcpCallCount;
   const id = Date.now();
+
+  // Summarise params for logging (avoid dumping huge token strings)
+  const logParams = method === 'tools/call'
+    ? { name: params?.name, arguments: params?.arguments }
+    : params;
+  console.log(`[Memori MCP #${callNum}] → ${method}`, logParams);
+
   const body = JSON.stringify({
     jsonrpc: '2.0',
     id,
@@ -304,19 +315,30 @@ async function mcpRequest(method, params, token) {
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
   }
+
+  const t0 = Date.now();
   const res = await fetch(MCP_ENDPOINT, {
     method: 'POST',
     headers,
     body
   });
+  const elapsed = Date.now() - t0;
+
   if (res.status === 401) {
+    console.warn(`[Memori MCP #${callNum}] ← 401 Unauthorized (${elapsed}ms)`);
     const wwwAuth = res.headers.get('WWW-Authenticate') ||
       res.headers.get('x-amzn-remapped-www-authenticate');
     return { needsAuth: true, wwwAuthenticate: wwwAuth };
   }
+  if (res.status === 429) {
+    console.warn(`[Memori MCP #${callNum}] ← 429 Rate Limited (${elapsed}ms)`);
+    throw new Error('Rate limit exceeded. Please slow down requests.');
+  }
   if (!res.ok) {
+    console.error(`[Memori MCP #${callNum}] ← ${res.status} ${res.statusText} (${elapsed}ms)`);
     throw new Error(`MCP request failed: ${res.status} ${res.statusText}`);
   }
+
   const contentType = res.headers.get('Content-Type') || '';
   let data;
   if (contentType.includes('text/event-stream')) {
@@ -325,10 +347,28 @@ async function mcpRequest(method, params, token) {
   } else {
     data = await res.json();
   }
+
   if (data.error) {
+    console.error(`[Memori MCP #${callNum}] ← error (${elapsed}ms)`, data.error);
     throw new Error(data.error.message || 'MCP error');
   }
-  return data.result;
+
+  // Log response — truncate large text content so the console stays readable
+  const result = data.result;
+  let logResult = result;
+  if (result?.content) {
+    logResult = {
+      ...result,
+      content: result.content.map(c =>
+        c.type === 'text' && c.text?.length > 300
+          ? { type: 'text', text: c.text.slice(0, 300) + `… [+${c.text.length - 300} chars]` }
+          : c
+      )
+    };
+  }
+  console.log(`[Memori MCP #${callNum}] ← OK (${elapsed}ms)`, logResult);
+
+  return result;
 }
 
 // Parse SSE (Server-Sent Events) response from MCP
@@ -919,18 +959,24 @@ function composeGranolaGroundedPrompt(userQuery, granolaContext) {
   return sections.join('\n\n\n');
 }
 
-// Optimised M-send flow — exactly 5 MCP calls regardless of meeting count:
+// Optimised M-send flow — exactly 4 MCP calls, no get_meetings at all:
 //   1. initialize
-//   2. list_meetings         → lightweight stubs (id + title + date)
-//   3. tools/list            → find the chat tool name
-//   4. query_granola_meetings → identify relevant meeting IDs via citations
-//   5. get_meetings (batch)  → full notes for relevant IDs only
+//   2. list_meetings           → lightweight stubs (id + title + date)
+//   3. tools/list              → find the chat tool name
+//   4. query_granola_meetings  → synthesised context + cited meeting IDs
+//
+// The query_granola_meetings response already contains the full meeting
+// context synthesised by Granola — we store it and use it directly in
+// the final prompt, avoiding any get_meetings calls.
 async function granolaFetchMeetingsForQuery(userQuery) {
   const token = await getGranolaToken();
   if (!token) return { meetings: [], error: 'Not authenticated', needsAuth: true };
 
+  console.log('[Memori] granolaFetchMeetingsForQuery — resetting session call counter');
+  _mcpCallCount = 0;
+
   try {
-    // 1. Initialize (once, shared across all steps)
+    // 1. Initialize (once, shared)
     const initResult = await mcpRequest('initialize', {
       protocolVersion: '2025-03-26',
       capabilities: {},
@@ -938,7 +984,7 @@ async function granolaFetchMeetingsForQuery(userQuery) {
     }, token);
     if (initResult?.needsAuth) return { meetings: [], error: 'Session expired', needsAuth: true };
 
-    // 2. list_meetings — IDs + titles only, no notes fetched yet
+    // 2. list_meetings — IDs + titles + dates, no notes
     const now = new Date();
     const ninetyDaysAgo = new Date(now);
     ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
@@ -948,6 +994,7 @@ async function granolaFetchMeetingsForQuery(userQuery) {
     }, token);
     const hasContent = listResult?.content?.some(c => c.type === 'text' && c.text?.trim());
     if (!hasContent) {
+      // One retry with no date args if the range returned nothing
       listResult = await mcpRequest('tools/call', { name: 'list_meetings', arguments: {} }, token);
     }
 
@@ -955,20 +1002,21 @@ async function granolaFetchMeetingsForQuery(userQuery) {
                      (typeof listResult === 'string' ? listResult : '');
     let allStubs = parseGranolaMeetingsXml(listText);
     if (allStubs.length === 0 && listText) {
-      // Fallback: extract bare IDs from attribute patterns
       const idMatches = listText.match(/id="([^"]+)"/g) || [];
       allStubs = idMatches.map(m => ({
         id: m.replace(/id="|"/g, ''), title: '', date: '', attendees: [], notes: '', content: ''
       }));
     }
-    if (allStubs.length === 0) return { meetings: [] };
+    if (allStubs.length === 0) return { meetings: [], synthesizedContext: '' };
 
-    // 3. tools/list — find the chat tool
+    // 3. tools/list — discover the chat tool name
     const toolsList = await mcpRequest('tools/list', {}, token);
     const chatTool = selectGranolaChatTool(toolsList?.tools || []);
 
-    // 4. query_granola_meetings — ask Granola which meetings are relevant
+    // 4. query_granola_meetings — Granola synthesises context and cites meetings
+    let synthesizedContext = '';
     const relevantIds = new Set();
+
     if (chatTool?.name) {
       const question = [
         'Use my Granola meeting context to answer this user request.',
@@ -979,16 +1027,19 @@ async function granolaFetchMeetingsForQuery(userQuery) {
         name: chatTool.name,
         arguments: buildChatToolArgs(chatTool, question)
       }, token);
-      const contextText = extractMcpToolText(chatResult);
+      synthesizedContext = extractMcpToolText(chatResult);
+
+      // Extract meeting UUIDs from citation URLs in the response
       const urlPattern = /https:\/\/notes\.granola\.ai\/d\/([\w-]+)/g;
       let urlMatch;
-      while ((urlMatch = urlPattern.exec(contextText)) !== null) {
+      while ((urlMatch = urlPattern.exec(synthesizedContext)) !== null) {
         relevantIds.add(urlMatch[1]);
       }
     }
 
-    // Keep only the relevant stubs (or all if relevance detection gave nothing)
-    // Deduplicate by ID so we never show the same meeting twice
+    console.log(`[Memori] granolaFetchMeetingsForQuery — total MCP calls: ${_mcpCallCount}`);
+
+    // Filter stubs to cited/relevant ones, deduplicate by ID
     const seenIds = new Set();
     const rawRelevant = relevantIds.size > 0
       ? allStubs.filter(s => relevantIds.has(s.id))
@@ -998,67 +1049,15 @@ async function granolaFetchMeetingsForQuery(userQuery) {
       seenIds.add(s.id);
       return true;
     });
-    if (relevantStubs.length === 0) return { meetings: [] };
 
-    // 5. get_meetings — one call PER relevant meeting (typically 2-5 calls).
-    // We do NOT batch because the combined response text makes it impossible
-    // to reliably attribute titles/dates/notes to individual meetings.
-    // list_meetings already gave us the correct unique title & date per stub,
-    // so we only need get_meetings for the notes content.
-    const isBad = t => !t || t === 'Meeting' || t === 'Untitled Meeting';
-    const meetingsWithNotes = [];
-
-    for (const stub of relevantStubs) {
-      if (!stub.id) {
-        meetingsWithNotes.push({ ...stub });
-        continue;
-      }
-      try {
-        const getResult = await mcpRequest('tools/call', {
-          name: 'get_meetings',
-          arguments: { meeting_ids: [stub.id] }
-        }, token);
-        const rawText = getResult?.content?.find(c => c.type === 'text')?.text || '';
-        const parsed = parseGranolaMeetingsXml(rawText);
-        const found = parsed.find(p => p.id === stub.id) || parsed[0];
-        const notes = found?.notes || found?.content || rawText;
-
-        // Title & date: trust list_meetings stub first; only override if
-        // get_meetings unambiguously gives something better for this single meeting.
-        let title = stub.title || '';
-        let date  = stub.date  || '';
-        let attendees = stub.attendees || [];
-
-        if (found) {
-          if (isBad(title) && !isBad(found.title)) title = found.title;
-          if (!date && found.date) date = found.date;
-          if (!attendees.length && found.attendees?.length) attendees = found.attendees;
-        }
-        // Last resort: extract from raw text only when stub had nothing
-        if (isBad(title) || !date) {
-          const ex = extractTitleDateFromText(rawText);
-          if (isBad(title) && !isBad(ex.title)) title = ex.title;
-          if (!date && ex.date) date = ex.date;
-        }
-
-        meetingsWithNotes.push({
-          ...stub,
-          title: title || 'Untitled Meeting',
-          date,
-          attendees,
-          notes,
-          content: notes
-        });
-      } catch (e) {
-        console.warn('[Memori] get_meetings failed for', stub.id, e);
-        meetingsWithNotes.push({ ...stub });
-      }
-    }
-
-    return { meetings: meetingsWithNotes, needsAuth: false };
+    return {
+      meetings: relevantStubs,      // stubs with title + date from list_meetings
+      synthesizedContext,           // full Granola-synthesised context for the prompt
+      needsAuth: false
+    };
   } catch (error) {
     console.error('[Memori] granolaFetchMeetingsForQuery error:', error);
-    return { meetings: [], error: error.message };
+    return { meetings: [], synthesizedContext: '', error: error.message };
   }
 }
 

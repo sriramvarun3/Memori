@@ -9,8 +9,9 @@ let saveButton = null;
 let autoCaptureEnabled = false;
 let mSendButton = null;
 let mSendInProgress = false;
-let mSendPendingQuery = null;   // user query waiting for meeting selection
-let mSendPendingMeetings = [];  // fetched meetings currently shown in sidebar
+let mSendPendingQuery = null;          // user query waiting for meeting selection
+let mSendPendingMeetings = [];         // fetched meeting stubs shown in sidebar
+let mSendSynthesizedContext = '';      // pre-fetched Granola context (avoids extra MCP calls)
 
 // ChatGPT input selectors (may need updates if ChatGPT changes their DOM)
 const INPUT_SELECTORS = [
@@ -384,6 +385,7 @@ async function handleGranolaGroundedMSend() {
     // Store state and render checklist
     mSendPendingQuery = userQuery;
     mSendPendingMeetings = meetings;
+    mSendSynthesizedContext = result.synthesizedContext || '';
     renderGranolaMeetingsWithCheckboxes(userQuery, meetings);
 
   } catch (err) {
@@ -1242,6 +1244,7 @@ function renderGranolaMeetingsWithCheckboxes(userQuery, meetings) {
   panel.querySelector('#memori-granola-cancel-btn').addEventListener('click', () => {
     mSendPendingQuery = null;
     mSendPendingMeetings = [];
+    mSendSynthesizedContext = '';
     showGranolaIdleState();
   });
 }
@@ -1264,29 +1267,30 @@ async function applyGranolaSelection() {
       return;
     }
 
-    // Build combined context from selected meetings
-    const selectedMeetings = Array.from(checkedBoxes).map(cb => {
-      const idx = parseInt(cb.getAttribute('data-meeting-index'), 10);
-      return mSendPendingMeetings[idx];
-    }).filter(Boolean);
-
-    const meetingsContext = selectedMeetings.map(m => {
-      const title = m.title || m.name || m.subject || 'Untitled Meeting';
-      const date = m.date || m.meeting_date || m.created_at || m.start_time || '';
-      const attendees = m.attendees || m.participants || [];
-      const attendeesStr = Array.isArray(attendees) ? attendees.join(', ') : (attendees || '');
-      const notes = m.notes || m.content || m.raw || m.summary_text || m.summary_markdown || '';
-      const header = [
-        `### ${title}`,
-        date ? `Date: ${date}` : '',
-        attendeesStr ? `Attendees: ${attendeesStr}` : ''
-      ].filter(Boolean).join('\n');
-      return header + (notes ? '\n\n' + notes : '');
-    }).join('\n\n---\n\n');
-
     const userQuery = mSendPendingQuery;
 
-    // Ask background to compose the grounded prompt
+    // Identify selected and deselected meeting titles so we can guide the LLM
+    const allIndices = Array.from(panel?.querySelectorAll('.memori-granola-checkbox') || [])
+      .map(cb => parseInt(cb.getAttribute('data-meeting-index'), 10));
+    const checkedIndices = new Set(
+      Array.from(checkedBoxes).map(cb => parseInt(cb.getAttribute('data-meeting-index'), 10))
+    );
+    const selectedTitles = allIndices
+      .filter(i => checkedIndices.has(i))
+      .map(i => mSendPendingMeetings[i]?.title || 'Untitled Meeting');
+    const excludedTitles = allIndices
+      .filter(i => !checkedIndices.has(i))
+      .map(i => mSendPendingMeetings[i]?.title || 'Untitled Meeting');
+
+    // Use the pre-fetched synthesised context (no extra MCP calls needed)
+    // If user excluded some meetings, append a note so the LLM can deprioritise them
+    let meetingsContext = mSendSynthesizedContext || '';
+    if (excludedTitles.length > 0) {
+      meetingsContext +=
+        `\n\n---\n\nNote: The user has asked to exclude the following meetings from consideration: ${excludedTitles.join(', ')}. Please focus only on context from: ${selectedTitles.join(', ')}.`;
+    }
+
+    // Ask background to compose the grounded prompt (no MCP calls — pure formatting)
     const result = await chrome.runtime.sendMessage({
       action: 'composeGroundedPromptFromMeetings',
       userQuery,
@@ -1315,6 +1319,7 @@ async function applyGranolaSelection() {
     // Reset state and show idle
     mSendPendingQuery = null;
     mSendPendingMeetings = [];
+    mSendSynthesizedContext = '';
     showGranolaIdleState();
 
   } catch (err) {
