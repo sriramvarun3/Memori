@@ -557,6 +557,37 @@ function parseGranolaMeetingsXml(text) {
   const meetings = [];
   if (!text || !text.trim()) return meetings;
 
+  // Strategy 0: JSON array or object with a meetings/data array.
+  // Granola may return list_meetings as JSON instead of XML.
+  const trimmed = text.trim();
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const arr = Array.isArray(parsed)
+        ? parsed
+        : (parsed.meetings || parsed.data || parsed.results || []);
+      if (Array.isArray(arr) && arr.length > 0) {
+        for (const m of arr) {
+          if (!m || typeof m !== 'object') continue;
+          const id = m.id || m.meeting_id || '';
+          if (!id) continue;
+          const attendeesRaw = m.attendees || m.participants || [];
+          meetings.push({
+            id,
+            title: m.title || m.name || m.meeting_title || '',
+            date: m.date || m.meeting_date || m.start_time || m.started_at || '',
+            attendees: Array.isArray(attendeesRaw) ? attendeesRaw : [],
+            notes: m.notes || m.summary || m.enhanced_notes || '',
+            content: m.notes || m.summary || m.enhanced_notes || ''
+          });
+        }
+        if (meetings.length > 0) return meetings;
+      }
+    } catch (_) {
+      // Not valid JSON — fall through to XML strategies
+    }
+  }
+
   // Helper: extract value of a named attribute from a tag attribute string
   function attr(attrStr, name) {
     const m = attrStr.match(new RegExp(name + '="([^"]*)"', 'i'));
@@ -629,6 +660,312 @@ function parseGranolaMeetingsXml(text) {
     }
   }
 
+  return meetings;
+}
+
+function granolaProseMirrorToMarkdown(node) {
+  if (!node || typeof node !== 'object') return '';
+
+  const renderChildren = () => (Array.isArray(node.content) ? node.content.map(granolaProseMirrorToMarkdown).join('') : '');
+
+  switch (node.type) {
+    case 'doc':
+      return renderChildren().trim();
+    case 'text': {
+      let text = node.text || '';
+      const marks = Array.isArray(node.marks) ? node.marks : [];
+      for (const mark of marks) {
+        if (mark?.type === 'bold') text = `**${text}**`;
+        else if (mark?.type === 'italic') text = `*${text}*`;
+        else if (mark?.type === 'code') text = `\`${text}\``;
+      }
+      return text;
+    }
+    case 'paragraph': {
+      const text = renderChildren().trim();
+      return text ? `${text}\n\n` : '';
+    }
+    case 'heading': {
+      const level = Math.max(1, Math.min(6, node.attrs?.level || 1));
+      const text = renderChildren().trim();
+      return text ? `${'#'.repeat(level)} ${text}\n\n` : '';
+    }
+    case 'bulletList':
+      return (Array.isArray(node.content) ? node.content.map(granolaProseMirrorToMarkdown).join('') : '') + '\n';
+    case 'orderedList':
+      return (Array.isArray(node.content) ? node.content.map((child, idx) => granolaProseMirrorToMarkdown({ ...child, _listIndex: idx + 1 })).join('') : '') + '\n';
+    case 'listItem': {
+      const text = renderChildren().trim();
+      if (!text) return '';
+      const prefix = node._listIndex ? `${node._listIndex}. ` : '- ';
+      return `${prefix}${text}\n`;
+    }
+    case 'blockquote': {
+      const text = renderChildren().trim();
+      return text ? text.split('\n').map(line => `> ${line}`).join('\n') + '\n\n' : '';
+    }
+    case 'hardBreak':
+      return '\n';
+    default:
+      return renderChildren();
+  }
+}
+
+function extractMeaningfulText(value, depth = 0) {
+  if (depth > 6 || value == null) return [];
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    if (/^(text|doc|paragraph|heading|bulletList|orderedList|listItem|hardBreak)$/i.test(trimmed)) {
+      return [];
+    }
+    return [trimmed];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap(item => extractMeaningfulText(item, depth + 1));
+  }
+  if (typeof value !== 'object') return [];
+
+  if (value.type === 'doc' && Array.isArray(value.content)) {
+    const md = granolaProseMirrorToMarkdown(value).trim();
+    return md ? [md] : [];
+  }
+
+  const preferredKeys = [
+    'enhanced_notes',
+    'private_notes',
+    'notes',
+    'summary_markdown',
+    'summary_text',
+    'summary',
+    'markdown',
+    'text',
+    'body',
+    'description',
+    'content',
+    'note',
+    'note_text',
+    'last_viewed_panel',
+    'panel',
+    'document'
+  ];
+
+  let results = [];
+  for (const key of preferredKeys) {
+    if (value[key] !== undefined) {
+      results = results.concat(extractMeaningfulText(value[key], depth + 1));
+    }
+  }
+
+  for (const [key, nested] of Object.entries(value)) {
+    if (preferredKeys.includes(key)) continue;
+    if (/^(id|uuid|meeting_id|meetingId|title|name|subject|date|meeting_date|start_time|started_at|attendees|participants|organizer|created_at|updated_at|type|marks|attrs|jsonrpc|role)$/i.test(key)) {
+      continue;
+    }
+    results = results.concat(extractMeaningfulText(nested, depth + 1));
+  }
+
+  return results;
+}
+
+function extractGranolaNotesFromXml(text) {
+  if (!text || typeof text !== 'string') return '';
+
+  const tagNames = ['private_notes', 'enhanced_notes', 'notes', 'summary_text', 'summary'];
+  for (const tag of tagNames) {
+    const match = text.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i'));
+    if (match && match[1] && match[1].trim()) {
+      return match[1].trim();
+    }
+  }
+
+  return '';
+}
+
+function normaliseGranolaMeetingText(text) {
+  if (!text || typeof text !== 'string') return '';
+
+  let cleaned = text.replace(/\r/g, '\n').replace(/\u00a0/g, ' ').trim();
+  if (/^(text|doc|paragraph|heading|bulletList|orderedList|listItem|hardBreak)$/i.test(cleaned)) {
+    return '';
+  }
+
+  // Granola sometimes returns XML wrappers around the actual meeting notes.
+  if (/<meetings_data\b|<meeting\b|<private_notes\b|<enhanced_notes\b/i.test(cleaned)) {
+    const directNotes = extractGranolaNotesFromXml(cleaned);
+    if (directNotes) {
+      cleaned = directNotes;
+    } else {
+      const parsed = parseGranolaMeetingsXml(cleaned);
+      const extractedNotes = parsed
+        .map(m => (m?.notes || m?.content || '').trim())
+        .filter(Boolean)
+        .join('\n\n');
+      if (extractedNotes) cleaned = extractedNotes;
+    }
+  }
+
+  cleaned = cleaned
+    .replace(/<\/?[^>]+>/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  const lines = cleaned.split('\n').map(line => line.trim());
+  const compact = [];
+  let previousBlank = false;
+
+  for (const line of lines) {
+    if (!line) {
+      if (!previousBlank && compact.length > 0) compact.push('');
+      previousBlank = true;
+      continue;
+    }
+
+    // Drop obvious low-value filler that bloats the prompt.
+    if (/^no summary$/i.test(line)) continue;
+
+    compact.push(line);
+    previousBlank = false;
+  }
+
+  return compact.join('\n').trim();
+}
+
+function chooseBestMeetingText(...sources) {
+  const candidates = sources
+    .flatMap(source => extractMeaningfulText(source))
+    .map(normaliseGranolaMeetingText)
+    .filter(Boolean);
+
+  if (candidates.length === 0) return '';
+
+  const unique = [...new Set(candidates)];
+  unique.sort((a, b) => b.length - a.length);
+
+  const meaningful = unique.find(text => !isThinMeetingText(text));
+  return meaningful || unique[0];
+}
+
+function normaliseGranolaMeeting(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+
+  const id = raw.id || raw.meeting_id || raw.meetingId || raw.uuid || raw.meeting_uuid || '';
+  if (!id) return null;
+
+  const attendeesRaw = raw.attendees || raw.participants || raw.attendee_names || [];
+  let attendees = [];
+  if (Array.isArray(attendeesRaw)) {
+    attendees = attendeesRaw
+      .map(a => {
+        if (typeof a === 'string') return a.trim();
+        if (a && typeof a === 'object') return (a.name || a.email || '').trim();
+        return '';
+      })
+      .filter(Boolean);
+  } else if (typeof attendeesRaw === 'string') {
+    attendees = attendeesRaw.split(',').map(s => s.trim()).filter(Boolean);
+  }
+
+  const notes = chooseBestMeetingText(
+    raw.enhanced_notes,
+    raw.private_notes,
+    raw.notes,
+    raw.summary_markdown,
+    raw.summary_text,
+    raw.summary,
+    raw.markdown,
+    raw.note,
+    raw.note_text,
+    raw.body,
+    raw.content,
+    raw.last_viewed_panel,
+    raw.panel,
+    raw.document,
+    raw.enhancement,
+    raw
+  );
+
+  return {
+    id: String(id),
+    title: raw.title || raw.name || raw.meeting_title || raw.subject || '',
+    date: raw.date || raw.meeting_date || raw.start_time || raw.started_at || raw.when || '',
+    attendees,
+    notes: typeof notes === 'string' ? notes : '',
+    content: typeof notes === 'string' ? notes : ''
+  };
+}
+
+function isThinMeetingText(text) {
+  if (!text) return true;
+  const trimmed = text.trim();
+  if (trimmed.length < 120) return true;
+
+  const lines = trimmed.split('\n').map(line => line.trim()).filter(Boolean);
+  const nonMetaLines = lines.filter(line => {
+    return !/(note creator|from stanford|attendee|participants?|organizer|calendar|meeting date|scheduled|invitees?)/i.test(line);
+  });
+
+  return nonMetaLines.join(' ').length < 120;
+}
+
+function extractGranolaMeetingsFromToolResult(toolResult) {
+  const meetings = [];
+  const seenIds = new Set();
+
+  function pushMeeting(raw) {
+    const meeting = normaliseGranolaMeeting(raw);
+    if (!meeting || !meeting.id || seenIds.has(meeting.id)) return;
+    seenIds.add(meeting.id);
+    meetings.push(meeting);
+  }
+
+  function visit(value, depth = 0) {
+    if (depth > 6 || value == null) return;
+
+    if (typeof value === 'string') {
+      for (const meeting of parseGranolaMeetingsXml(value)) {
+        pushMeeting(meeting);
+      }
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      const direct = value.map(normaliseGranolaMeeting).filter(Boolean);
+      if (direct.length > 0) {
+        direct.forEach(pushMeeting);
+        return;
+      }
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+
+    if (typeof value !== 'object') return;
+
+    pushMeeting(value);
+
+    if (Array.isArray(value.content)) {
+      for (const item of value.content) {
+        if (typeof item?.text === 'string') visit(item.text, depth + 1);
+        if (item?.json !== undefined) visit(item.json, depth + 1);
+        if (item?.data !== undefined) visit(item.data, depth + 1);
+        if (item?.structuredContent !== undefined) visit(item.structuredContent, depth + 1);
+        if (item?.structured_content !== undefined) visit(item.structured_content, depth + 1);
+      }
+    }
+
+    visit(value.structuredContent, depth + 1);
+    visit(value.structured_content, depth + 1);
+    visit(value.result, depth + 1);
+    visit(value.meetings, depth + 1);
+    visit(value.data, depth + 1);
+    visit(value.results, depth + 1);
+    visit(value.items, depth + 1);
+  }
+
+  visit(toolResult);
   return meetings;
 }
 
@@ -791,11 +1128,43 @@ async function granolaGetMeetingDetails(meetingId) {
       name: 'get_meetings',
       arguments: { meeting_ids: [meetingId] }
     }, token);
-    if (!toolResult || !toolResult.content) {
+    if (!toolResult) {
       return { error: 'No meeting data' };
     }
-    const textContent = toolResult.content.find(c => c.type === 'text');
-    const text = textContent ? textContent.text : '';
+
+    const parsedMeetings = extractGranolaMeetingsFromToolResult(toolResult);
+    const matched = parsedMeetings.find(m => m.id === meetingId) || parsedMeetings[0];
+    const rawText = extractMcpToolText(toolResult);
+    const parsedFromRaw = rawText ? parseGranolaMeetingsXml(rawText) : [];
+    const rawMatch = parsedFromRaw.find(m => m.id === meetingId) || parsedFromRaw[0];
+    const directXmlNotes = extractGranolaNotesFromXml(rawText);
+
+    // Prefer the direct XML note body from get_meetings. This path is the most
+    // reliable for Granola and avoids the generic recursive extractor discarding
+    // valid XML-backed notes as empty.
+    let text = normaliseGranolaMeetingText(directXmlNotes || rawMatch?.notes || rawMatch?.content || rawText);
+
+    // Fallback for non-XML/structured responses.
+    if (!text) {
+      text = chooseBestMeetingText(
+        matched,
+        toolResult?.structuredContent,
+        toolResult?.structured_content,
+        toolResult?.content,
+        rawText
+      );
+    }
+
+    console.log('[Memori] granolaGetMeetingDetails extraction', {
+      meetingId,
+      parsedCandidatePreview: (matched?.notes || matched?.content || '').slice(0, 400),
+      rawTextPreview: (rawText || '').slice(0, 400),
+      chosenPreview: (text || '').slice(0, 400)
+    });
+
+    if (!text) {
+      return { error: 'No meeting data' };
+    }
     return { meeting: text };
   } catch (error) {
     return { error: error.message };
@@ -845,6 +1214,14 @@ function extractMcpToolText(toolResult) {
       .map(c => c.text.trim())
       .filter(Boolean);
     if (textParts.length > 0) return textParts.join('\n\n');
+  }
+  const structured = toolResult.structuredContent || toolResult.structured_content;
+  if (structured !== undefined) {
+    try {
+      return typeof structured === 'string' ? structured.trim() : JSON.stringify(structured, null, 2);
+    } catch (_) {
+      // Ignore serialization failures and keep falling through.
+    }
   }
   if (typeof toolResult.text === 'string') return toolResult.text.trim();
   return '';
@@ -947,7 +1324,7 @@ function cleanGranolaContext(raw, meetingNames) {
 
 function composeGranolaGroundedPrompt(userQuery, granolaContext, meetingNames) {
   const sections = [
-    'I have a question for you. I\'m also sharing relevant context from my Granola meeting notes to help ground your answer.',
+    'Answer the question using only the selected Granola meeting context below where relevant.',
 
     '## My Question\n\n' + userQuery,
 
@@ -956,13 +1333,19 @@ function composeGranolaGroundedPrompt(userQuery, granolaContext, meetingNames) {
     [
       '## How I\'d Like You to Respond',
       '',
-      'Be concise and direct. Skip preamble — get straight to the point.',
+      'Be concise and direct. Skip preamble and get straight to the answer.',
       '',
       '- **Answer the question first.** Lead with the most useful, actionable insight.',
       '',
-      '- **Reference the meeting context naturally** when it\'s relevant — e.g. "Based on your conversation with [person] in [meeting]..." — but don\'t quote notes at length.',
+      '- **Use only the selected meetings above.** Do not mention or rely on any excluded meetings.',
       '',
-      '- **Keep it short.** Use bullet points or a brief numbered list if there are multiple steps. Avoid long paragraphs.',
+      '- **Personalize around preferences.** If the meeting context mentions foods, meals, exercises, routines, or habits I like, dislike, avoid, prefer, or struggle with, explicitly use those preferences to shape the recommendations.',
+      '',
+      '- **Reference preferences concretely.** For example, if I dislike a food or workout, do not recommend it as the default plan; if I prefer a certain food, exercise, or routine, use that as the starting point when it fits.',
+      '',
+      '- **Keep it to one page max.** Aim for a concise response, roughly 6-10 bullets or a very short numbered list.',
+      '',
+      '- **Summarize, don\'t dump notes.** Synthesize the meeting context into advice instead of repeating raw details.',
       '',
       '- If the context doesn\'t cover the question, say so in one sentence and give your best general answer.'
     ].join('\n')
@@ -996,29 +1379,36 @@ async function granolaFetchMeetingsForQuery(userQuery) {
     }, token);
     if (initResult?.needsAuth) return { meetings: [], error: 'Session expired', needsAuth: true };
 
-    // 2. list_meetings — IDs + titles + dates, no notes
-    const now = new Date();
-    const ninetyDaysAgo = new Date(now);
-    ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+    // 2. list_meetings — IDs + titles + dates, no notes.
+    // Do NOT pass a date range here. Using a fixed window (e.g. 90 days) means
+    // query_granola_meetings can surface older meetings that list_meetings would
+    // never include, causing an ID mismatch and an empty result. Let Granola
+    // scope the window by the user's plan (30 days Basic, unlimited on paid).
     let listResult = await mcpRequest('tools/call', {
       name: 'list_meetings',
-      arguments: { date_from: ninetyDaysAgo.toISOString().split('T')[0], date_to: now.toISOString().split('T')[0] }
+      arguments: {}
     }, token);
-    const hasContent = listResult?.content?.some(c => c.type === 'text' && c.text?.trim());
-    if (!hasContent) {
-      // One retry with no date args if the range returned nothing
-      listResult = await mcpRequest('tools/call', { name: 'list_meetings', arguments: {} }, token);
+
+    const listText = extractMcpToolText(listResult);
+    let allStubs = extractGranolaMeetingsFromToolResult(listResult);
+
+    if (allStubs.length === 0 && listText) {
+      allStubs = parseGranolaMeetingsXml(listText);
     }
 
-    const listText = listResult?.content?.find(c => c.type === 'text')?.text ||
-                     (typeof listResult === 'string' ? listResult : '');
-    let allStubs = parseGranolaMeetingsXml(listText);
+    // Last-resort: pull bare id="..." attribute values if the full parser found nothing.
     if (allStubs.length === 0 && listText) {
       const idMatches = listText.match(/id="([^"]+)"/g) || [];
       allStubs = idMatches.map(m => ({
         id: m.replace(/id="|"/g, ''), title: '', date: '', attendees: [], notes: '', content: ''
       }));
     }
+    console.log('[Memori] list_meetings extraction', {
+      listResult,
+      listTextPreview: listText ? listText.slice(0, 1000) : '',
+      extractedStubCount: allStubs.length,
+      extractedStubIds: allStubs.map(s => s.id).filter(Boolean)
+    });
     if (allStubs.length === 0) return { meetings: [], synthesizedContext: '' };
 
     // 3. tools/list — discover the chat tool name
@@ -1030,10 +1420,16 @@ async function granolaFetchMeetingsForQuery(userQuery) {
     const relevantIds = new Set();
 
     if (chatTool?.name) {
+      // Ask Granola to find and cite ALL relevant meetings, not just answer the question.
+      // "Answer this request" causes Granola to synthesize a concise response and only
+      // cite the top 1-2 meetings. We need comprehensive citation of every relevant meeting.
       const question = [
-        'Use my Granola meeting context to answer this user request.',
         `User request: ${userQuery}`,
-        'If relevant context is missing, say that explicitly.'
+        '',
+        'Search my meeting notes for ALL meetings that are relevant to this request.',
+        'For every relevant meeting you find — even ones that are only tangentially related — include its citation link.',
+        'Be exhaustive: do not omit meetings just because another meeting is more relevant.',
+        'After citing all relevant meetings, summarize the key context from each one.'
       ].join('\n');
       const chatResult = await mcpRequest('tools/call', {
         name: chatTool.name,
@@ -1041,21 +1437,39 @@ async function granolaFetchMeetingsForQuery(userQuery) {
       }, token);
       synthesizedContext = extractMcpToolText(chatResult);
 
-      // Extract meeting UUIDs from citation URLs in the response
-      const urlPattern = /https:\/\/notes\.granola\.ai\/d\/([\w-]+)/g;
+      // Extract meeting UUIDs from citation URLs anywhere in the response.
+      // Granola may format citations as bare URLs or as [[n]](url) markdown links.
+      const urlPattern = /https?:\/\/(?:notes|app)\.granola\.ai\/(?:d|doc|meetings?)\/([0-9a-f-]{8,})/gi;
       let urlMatch;
       while ((urlMatch = urlPattern.exec(synthesizedContext)) !== null) {
-        relevantIds.add(urlMatch[1]);
+        relevantIds.add(urlMatch[1].toLowerCase());
       }
+      console.log('[Memori] query_granola_meetings extraction', {
+        synthesizedContextPreview: synthesizedContext ? synthesizedContext.slice(0, 1500) : '',
+        relevantIds: Array.from(relevantIds)
+      });
     }
 
     console.log(`[Memori] granolaFetchMeetingsForQuery — total MCP calls: ${_mcpCallCount}`);
 
-    // Filter stubs to cited/relevant ones, deduplicate by ID
+    // Filter stubs to cited/relevant ones, deduplicate by ID.
+    // relevantIds are lowercased so normalise stub IDs when comparing.
     const seenIds = new Set();
-    const rawRelevant = relevantIds.size > 0
-      ? allStubs.filter(s => relevantIds.has(s.id))
-      : allStubs;
+    let rawRelevant;
+    if (relevantIds.size > 0) {
+      const matched = allStubs.filter(s => relevantIds.has((s.id || '').toLowerCase()));
+      // If citation IDs were found but none match the stubs (e.g. the cited meetings
+      // are outside the window returned by list_meetings), fall back to all stubs so
+      // the user still sees something rather than an empty list.
+      rawRelevant = matched.length > 0 ? matched : allStubs;
+      console.log('[Memori] meeting match results', {
+        allStubIds: allStubs.map(s => s.id).filter(Boolean),
+        matchedIds: matched.map(s => s.id).filter(Boolean),
+        returnedIds: rawRelevant.map(s => s.id).filter(Boolean)
+      });
+    } else {
+      rawRelevant = allStubs;
+    }
     const relevantStubs = rawRelevant.filter(s => {
       if (!s.id || seenIds.has(s.id)) return false;
       seenIds.add(s.id);

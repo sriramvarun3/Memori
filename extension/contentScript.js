@@ -14,6 +14,20 @@ let mSendPendingMeetings = [];         // fetched meeting stubs shown in sidebar
 let mSendSynthesizedContext = '';      // pre-fetched Granola context (avoids extra MCP calls)
 let mSendMeetingNameMap = {};          // url → meeting title for source attribution
 
+function isSubstantiveMeetingText(text) {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (trimmed.length < 200) return false;
+
+  const withoutMetadata = trimmed
+    .replace(/\b[A-Z][a-z]+ [A-Z][a-z]+ \(note creator\)\b/g, '')
+    .replace(/\bfrom [A-Z][A-Za-z0-9 .&-]+\b/g, '')
+    .replace(/\b(?:participants?|attendees?|organizer|scheduled|meeting date)\b[:\s].*/gi, '')
+    .trim();
+
+  return withoutMetadata.length >= 160;
+}
+
 // ChatGPT input selectors (may need updates if ChatGPT changes their DOM)
 const INPUT_SELECTORS = [
   'textarea[data-id="root"]',
@@ -358,6 +372,11 @@ function openSidebarToGranolaTab() {
 
 async function handleGranolaGroundedMSend() {
   if (mSendInProgress) return;
+
+  if (!chrome?.runtime?.id || typeof chrome.runtime.sendMessage !== 'function') {
+    alert('Memori was reloaded. Refresh this tab, then try the M button again.');
+    return;
+  }
 
   const input = findChatGPTInput();
   if (!input) { alert('Could not find chat input'); return; }
@@ -1291,19 +1310,55 @@ async function applyGranolaSelection() {
     const checkedIndices = new Set(
       Array.from(checkedBoxes).map(cb => parseInt(cb.getAttribute('data-meeting-index'), 10))
     );
+    const selectedMeetings = allIndices
+      .filter(i => checkedIndices.has(i))
+      .map(i => mSendPendingMeetings[i])
+      .filter(Boolean);
     const selectedTitles = allIndices
       .filter(i => checkedIndices.has(i))
       .map(i => mSendPendingMeetings[i]?.title || 'Untitled Meeting');
-    const excludedTitles = allIndices
-      .filter(i => !checkedIndices.has(i))
-      .map(i => mSendPendingMeetings[i]?.title || 'Untitled Meeting');
+    // Build context only from selected meetings. Do not include synthesized context
+    // for deselected meetings and then ask the model to ignore it.
+    const selectedResults = await Promise.all(selectedMeetings.map(async (meeting, idx) => {
+      let text = meeting?.notes || meeting?.content || meeting?.raw || meeting?.summary_text || meeting?.summary_markdown || '';
+      const usedStubText = isSubstantiveMeetingText(text);
+      if (!isSubstantiveMeetingText(text) && meeting?.id) {
+        const detailResult = await chrome.runtime.sendMessage({
+          action: 'granolaGetMeetingDetails',
+          meetingId: meeting.id
+        });
+        if (detailResult?.error) {
+          throw new Error(`Could not load "${meeting.title || `Meeting ${idx + 1}`}": ${detailResult.error}`);
+        }
+        text = detailResult?.meeting || '';
+      }
+      console.log('[Memori] selected meeting context source', {
+        meetingId: meeting?.id,
+        title: meeting?.title,
+        usedStubText,
+        finalPreview: (text || '').slice(0, 300)
+      });
+      return { meeting, text: (text || '').trim() };
+    }));
 
-    // Use the pre-fetched synthesised context (no extra MCP calls needed)
-    // If user excluded some meetings, append a note so the LLM can deprioritise them
-    let meetingsContext = mSendSynthesizedContext || '';
-    if (excludedTitles.length > 0) {
-      meetingsContext +=
-        `\n\n---\n\nNote: The user has asked to exclude the following meetings from consideration: ${excludedTitles.join(', ')}. Please focus only on context from: ${selectedTitles.join(', ')}.`;
+    const selectedMeetingNameMap = {};
+    selectedMeetings.forEach(meeting => {
+      if (meeting?.id && meeting?.title) {
+        selectedMeetingNameMap[`https://notes.granola.ai/d/${meeting.id}`] = meeting.title;
+      }
+    });
+
+    const meetingsContext = selectedResults
+      .filter(({ text }) => text)
+      .map(({ meeting, text }, idx) => {
+        const title = meeting?.title || `Meeting ${idx + 1}`;
+        const date = meeting?.date ? ` (${meeting.date})` : '';
+        return `### ${title}${date}\n\n${text}`;
+      })
+      .join('\n\n---\n\n');
+
+    if (!meetingsContext) {
+      throw new Error(`Could not load notes for the selected meeting${selectedTitles.length > 1 ? 's' : ''}.`);
     }
 
     // Ask background to compose the grounded prompt (no MCP calls — pure formatting)
@@ -1311,7 +1366,7 @@ async function applyGranolaSelection() {
       action: 'composeGroundedPromptFromMeetings',
       userQuery,
       meetingsContext,
-      meetingNameMap: mSendMeetingNameMap
+      meetingNameMap: selectedMeetingNameMap
     });
 
     if (!result?.success || !result.composedPrompt) {
